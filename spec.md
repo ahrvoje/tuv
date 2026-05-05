@@ -14,7 +14,7 @@ Tuv is an alternate-screen terminal UI Python package manager backed by `uv`. It
 - Let the user select a discovered Python interpreter, a current-directory virtual environment, the active virtual environment, or the Tuv runner venv.
 - Show a tabular overview of all installed packages in the selected context.
 - Allow target version selection from the table and run installation for the focused package.
-- Keep the UI responsive while package operations run.
+- Start the UI immediately and keep it lightning responsive while package metadata and operations run asynchronously.
 - Be skilled at discovering the newest available Python interpreter on each supported platform.
 
 ## Non-Goals for v0.1
@@ -154,6 +154,7 @@ Native UI responsibilities:
 - Maintain table viewport state, focused row, and scroll offset.
 - Render the context selector as a lightweight combo overlay.
 - Render package version choices as a lightweight combo overlay.
+- When any modal dialog or selector is active, render the background content dimmed: it should lose color intensity and appear slightly darker while the modal remains visually dominant.
 - Use Unicode box-drawing characters for internal separators so table lines render as continuous terminal lines.
 - Do not draw far-left, far-right, top, or bottom boundary lines around the main table; preserving space is preferred.
 - Use Unicode arrow characters in the bottom key legend.
@@ -161,7 +162,9 @@ Native UI responsibilities:
 - Render failed rows in bold red.
 - Render current packages in light green.
 - Render the installation spinner in the fourth column.
+- Start the TUI shell immediately after launch; package tables may appear with installed versions first while latest target versions continue loading asynchronously.
 - Keep install subprocesses off the input/render loop with `threading` or `asyncio`.
+- Keep package refresh, outdated-version lookup, candidate-version lookup, and install subprocesses off the input/render loop.
 - Run installation jobs asynchronously so the TUI remains responsive for navigation, context viewing, status updates, and information panels during installation activity.
 - Do not run concurrent installations because dependency resolution and environment mutation can clash.
 - Run bulk updates sequentially and re-check package state after each install.
@@ -221,7 +224,7 @@ The application opens directly into the package manager view in the terminal alt
 Layout:
 
 ```text
-Context: [ .venv - Python 3.12.4 - C:\repo\.venv ]              Refreshing: idle
+[ .venv - Python 3.12.4 - C:\repo\.venv ]
 ────────────────────────────────────────────────────────────────────────────────
 Package                         Installed             Target                Act
 * pytest                        8.3.5                 8.3.5                 curr
@@ -233,6 +236,8 @@ Package                         Installed             Target                Act
 
 Top menu:
 
+- Shows the selected context directly, without a leading `Context:` label.
+- Omits idle/status text such as `Status: idle`; space is reserved for package data and controls.
 - Contains a context selector.
 - The selector is a combo control opened with `F9`.
 - `F9` focuses the context selector and opens the context combo.
@@ -291,11 +296,14 @@ Installed package list:
 - Use `<context-python> -m uv pip list --python <context> --format json` for a selected context.
 - For virtual environments, `<context>` may be the venv root path.
 - For interpreter contexts, `<context>` should be the interpreter executable path.
+- Load the installed package list first so the table can appear as soon as possible.
 
 Outdated package list:
 
 - Use `<context-python> -m uv pip list --python <context> --outdated --format json`.
 - Merge outdated data into the installed package table.
+- Load and merge outdated data asynchronously after the initial installed package table is visible.
+- While outdated data is still loading, target versions may temporarily equal installed versions.
 - Default target version:
   - Latest available version for outdated packages.
   - Installed version for current packages.
@@ -391,8 +399,7 @@ Recommended spinner frames:
 For failed rows, the panel must show:
 
 - Package name.
-- Installed version at the time of the attempted install.
-- Target version.
+- Version installed at the time of the attempted install, labeled `Version`.
 - Exit code.
 - Last relevant stdout and stderr lines.
 - Elapsed time.
@@ -403,6 +410,10 @@ The information panel is package-focused:
 
 - It does not need to include the full known versions list.
 - It does not need to include selected context details such as environment, interpreter, or Python path.
+- It does not need to include target version.
+- It does not need to include uninstall-safe marker state.
+- It does not need to include row status.
+- The installed package version should be labeled `Version`, not `Installed`.
 
 For every package row, the information panel must list:
 
@@ -489,6 +500,7 @@ Terminal rules:
 - Draw main table separators with Unicode box-drawing character `─`.
 - Do not draw main table outer boundary characters such as `┌`, `┐`, `└`, `┘`, or far-left/far-right `│`.
 - Modal overlays may still use boxed Unicode borders when a framed dialog improves clarity.
+- Modal overlays should dim the background content behind them so the inactive UI is visually subdued.
 - Use Unicode arrow glyphs in key legends: `↑`, `↓`, `←`, and `→`.
 
 ## State Model
@@ -533,10 +545,13 @@ InstallJob
 - The launcher discovers the newest usable Python interpreter.
 - The launcher does not require bare `uv` on `PATH`.
 - If `uv` is missing from the newest Python distribution, the user is offered installation and Tuv continues after confirmation.
+- Tuv enters the alternate-screen UI immediately after launch instead of blocking startup on latest-version lookup.
 - The context selector always includes `tuv venv`.
 - `F9` focuses and opens the context selector combo.
 - Selecting a context loads packages for that context.
+- Installed packages are rendered first, and latest target versions are updated asynchronously after the table is visible.
 - The table contains package name, installed version, target version, and action/status columns.
+- The top status bar starts directly with selected context data, without a leading `Context:` label or idle/status text.
 - The table uses Unicode separator lines and does not render broken ASCII-style lines.
 - The main table does not draw far-left, far-right, top, or bottom boundary lines.
 - The bottom key legend uses Unicode arrow glyphs for arrow-key hints.
@@ -553,6 +568,7 @@ InstallJob
 - `Enter` in the version selector starts installation of the highlighted version.
 - `Esc` closes the version selector.
 - `q` closes modal dialogs and selectors the same way as `Esc`.
+- Active modal dialogs and selectors dim the background content behind them.
 - `Enter` installs the selected target version through `python -m uv`.
 - `F2` asks for permission, then updates all ready packages sequentially only after confirmation.
 - Bulk update skips packages already installed or updated during the current session and does not install any package twice.
@@ -560,7 +576,9 @@ InstallJob
 - Installations run asynchronously and do not block table navigation, context selector access, or `F3` information panels.
 - If `Enter` requests another installation while one is running, the requested row displays `Wait` and no concurrent uv install starts.
 - A failed installation row is rendered bold red.
-- `F3` opens information for the focused row and shows failure details for failed rows.
+- `F3` opens package-focused information for the focused row and shows failure details for failed rows.
+- `F3` labels the installed package version as `Version`.
+- `F3` omits known versions, target version, uninstall marker, row status, and context/interpreter details.
 - The TUI remains responsive during installation.
 - After any completed installation, the full package table refreshes so dependency updates made by uv are reflected.
 - Packages installed or updated during the current Tuv session are colored white after refresh.
@@ -606,3 +624,4 @@ These examples describe behavior that must be treated as bugs and covered by reg
 - `q` key does not close any modal dialog or selector in the same way as `Esc`.
 - Large information dialog content is not scrollable as expected.
 - In the version selector, moving selection down scrolls the entire content upward while the selection marker stays at the top; the marker should move down until it reaches the visible selector boundary.
+- Tuv takes 1 second to start and show the initial screen; this is not acceptable because the first visual frame must be established in less than 100 ms.

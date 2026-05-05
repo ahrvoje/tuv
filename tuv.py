@@ -47,6 +47,7 @@ LIGHT_GREEN = "\x1b[92m"
 YELLOW = "\x1b[33m"
 REVERSE = "\x1b[7m"
 DIM = "\x1b[2m"
+MODAL_BACKDROP = "\x1b[2;90m"
 BOLD = "\x1b[1m"
 SPINNER = "-\\|/"
 
@@ -503,25 +504,60 @@ def build_package_rows(context: PythonContext, updated_names: set[str]) -> tuple
     if not isinstance(installed_data, list):
         raise RuntimeError("uv returned unexpected installed package data")
 
-    outdated_by_name: dict[str, dict[str, object]] = {}
-    outdated_warning: str | None = None
+    rows: list[PackageRow] = []
+    for item in installed_data:
+        if not isinstance(item, dict) or "name" not in item or "version" not in item:
+            continue
+        display_name = str(item["name"])
+        normalized = canonicalize_name(display_name)
+        installed = str(item["version"])
+        rows.append(
+            PackageRow(
+                name=normalized,
+                display_name=display_name,
+                uninstall_safe=False,
+                installed_version=installed,
+                target_version=installed,
+                candidate_versions=[installed],
+                status="current",
+                updated_in_session=normalized in updated_names,
+            )
+        )
+    rows.sort(key=lambda row: row.name)
+    return rows, None
+
+
+def latest_from_outdated_item(item: dict[str, object], installed: str | None = None) -> str | None:
+    latest = item.get("latest_version") or item.get("latest") or item.get("latest-version")
+    if latest is None:
+        return installed
+    return str(latest)
+
+
+def load_outdated_targets(context: PythonContext) -> tuple[dict[str, str], str | None]:
     try:
         outdated_data, _ = run_uv_json(
             context,
             ["pip", "list", "--python", context.uv_target, "--outdated", "--format", "json"],
         )
-        if isinstance(outdated_data, list):
-            for item in outdated_data:
-                if isinstance(item, dict) and "name" in item:
-                    outdated_by_name[canonicalize_name(str(item["name"]))] = item
     except Exception as exc:
-        outdated_warning = f"Outdated data unavailable: {last_lines(str(exc), 2)}"
+        return {}, f"Outdated data unavailable: {last_lines(str(exc), 2)}"
+    if not isinstance(outdated_data, list):
+        return {}, "Outdated data unavailable: uv returned unexpected data"
+    targets: dict[str, str] = {}
+    for item in outdated_data:
+        if not isinstance(item, dict) or "name" not in item:
+            continue
+        latest = latest_from_outdated_item(item)
+        if latest:
+            targets[canonicalize_name(str(item["name"]))] = latest
+    return targets, None
 
-    display_by_name = {
-        canonicalize_name(str(item["name"])): str(item["name"])
-        for item in installed_data
-        if isinstance(item, dict) and "name" in item
-    }
+
+def load_dependency_info(
+    context: PythonContext,
+    display_by_name: dict[str, str],
+) -> tuple[set[str], dict[str, list[str]], dict[str, list[str]]]:
     installed_names = set(display_by_name)
     deps_by_package = dependency_map(context)
     installed_deps_by_package = {
@@ -536,46 +572,15 @@ def build_package_rows(context: PythonContext, updated_names: set[str]) -> tuple
         for dep in deps:
             usage_by_package.setdefault(dep, set()).add(package_name)
     safe_names = installed_names - required_names
-    rows: list[PackageRow] = []
-    for item in installed_data:
-        if not isinstance(item, dict) or "name" not in item or "version" not in item:
-            continue
-        display_name = str(item["name"])
-        normalized = canonicalize_name(display_name)
-        installed = str(item["version"])
-        latest = installed
-        outdated = outdated_by_name.get(normalized)
-        if outdated:
-            latest = str(
-                outdated.get("latest_version")
-                or outdated.get("latest")
-                or outdated.get("latest-version")
-                or installed
-            )
-        candidates = sorted({installed, latest}, key=version_key)
-        target = latest
-        rows.append(
-            PackageRow(
-                name=normalized,
-                display_name=display_name,
-                uninstall_safe=normalized in safe_names,
-                installed_version=installed,
-                target_version=target,
-                candidate_versions=candidates,
-                status="ready" if target != installed else "current",
-                dependency_packages=[
-                    display_by_name.get(name, name)
-                    for name in sorted(installed_deps_by_package.get(normalized, set()))
-                ],
-                usage_packages=[
-                    display_by_name.get(name, name)
-                    for name in sorted(usage_by_package.get(normalized, set()))
-                ],
-                updated_in_session=normalized in updated_names,
-            )
-        )
-    rows.sort(key=lambda row: row.name)
-    return rows, outdated_warning
+    dependency_packages = {
+        name: [display_by_name.get(dep, dep) for dep in sorted(deps)]
+        for name, deps in installed_deps_by_package.items()
+    }
+    usage_packages = {
+        name: [display_by_name.get(user, user) for user in sorted(users)]
+        for name, users in usage_by_package.items()
+    }
+    return safe_names, dependency_packages, usage_packages
 
 
 def last_lines(text: str, count: int = 8) -> str:
@@ -780,8 +785,13 @@ class TuvApp:
         self.focus_index = 0
         self.scroll = 0
         self.message = "Starting..."
+        self.discovering_contexts = False
+        self.discovery_error: str | None = None
         self.refreshing = False
         self.refresh_context_id: str | None = None
+        self.refresh_generation = 0
+        self.outdated_loading = False
+        self.dependency_loading = False
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.updated_by_context: dict[str, set[str]] = {}
         self.installing = False
@@ -814,21 +824,8 @@ class TuvApp:
             pass
 
     def run(self) -> int:
-        try:
-            self.contexts = discover_contexts()
-        except Exception as exc:
-            print(f"Tuv failed during context discovery: {exc}", file=sys.stderr)
-            return 1
-
-        if not self.contexts:
-            print("Tuv could not find any usable Python context.", file=sys.stderr)
-            return 1
-
-        self.context_index = self.default_context_index()
-        self.context_overlay_index = self.context_index
-
         with self.terminal:
-            self.load_current_context()
+            self.start_context_discovery()
             while not self.should_quit:
                 self.process_events()
                 self.ensure_scroll_visible()
@@ -841,6 +838,39 @@ class TuvApp:
                 if key:
                     self.handle_key(key)
             return 0
+
+    def start_context_discovery(self) -> None:
+        if self.discovering_contexts:
+            return
+        self.discovering_contexts = True
+        self.discovery_error = None
+        self.message = "Discovering Python contexts"
+
+        def worker() -> None:
+            try:
+                contexts = discover_contexts()
+                self.event_queue.put(("contexts_done", contexts))
+            except Exception as exc:
+                self.event_queue.put(("contexts_failed", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_contexts_done(self, contexts: list[PythonContext]) -> None:
+        self.discovering_contexts = False
+        self.contexts = contexts
+        if not self.contexts:
+            self.discovery_error = "Tuv could not find any usable Python context."
+            self.message = self.discovery_error
+            return
+        self.context_index = self.default_context_index()
+        self.context_overlay_index = self.context_index
+        self.load_current_context()
+
+    def on_contexts_failed(self, error: str) -> None:
+        self.discovering_contexts = False
+        self.contexts = []
+        self.discovery_error = f"Context discovery failed: {last_lines(error, 2)}"
+        self.message = self.discovery_error
 
     def request_quit(self) -> None:
         self.should_quit = True
@@ -870,14 +900,15 @@ class TuvApp:
         self.bulk_active = False
         self.bulk_queue = []
         self.bulk_processed = set()
+        self.outdated_loading = False
+        self.dependency_loading = False
         self.info_open = False
         self.info_scroll = 0
         self.message = f"Loading {context.label}"
         self.ensure_uv(context, lambda: self.start_refresh(context, "Loading packages"))
 
     def ensure_uv(self, context: PythonContext, on_ready: Callable[[], None]) -> None:
-        if context.uv_available or has_uv(context.python_path):
-            context.uv_available = True
+        if context.uv_available:
             on_ready()
             return
 
@@ -921,20 +952,44 @@ class TuvApp:
         message: str,
         install_result: InstallResult | None = None,
     ) -> None:
-        if self.refreshing:
-            return
         self.refreshing = True
         self.refresh_context_id = context.id
+        self.refresh_generation += 1
+        generation = self.refresh_generation
+        self.outdated_loading = False
+        self.dependency_loading = False
         self.message = message
         updated_names = set(self.updated_by_context.get(context.id, set()))
 
         def worker() -> None:
             try:
                 rows, warning = build_package_rows(context, updated_names)
-                payload = (context.id, rows, warning, install_result)
+                payload = (context.id, generation, rows, warning, install_result)
                 self.event_queue.put(("refresh_done", payload))
             except Exception as exc:
-                self.event_queue.put(("refresh_failed", (context.id, str(exc), install_result)))
+                self.event_queue.put(("refresh_failed", (context.id, generation, str(exc), install_result)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_outdated_refresh(self, context: PythonContext, generation: int) -> None:
+        self.outdated_loading = True
+
+        def worker() -> None:
+            targets, warning = load_outdated_targets(context)
+            self.event_queue.put(("outdated_done", (context.id, generation, targets, warning)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_dependency_refresh(self, context: PythonContext, generation: int) -> None:
+        display_by_name = {row.name: row.display_name for row in self.rows}
+        self.dependency_loading = True
+
+        def worker() -> None:
+            try:
+                payload = load_dependency_info(context, display_by_name)
+                self.event_queue.put(("dependency_done", (context.id, generation, payload, None)))
+            except Exception as exc:
+                self.event_queue.put(("dependency_done", (context.id, generation, None, str(exc))))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -945,11 +1000,21 @@ class TuvApp:
             except queue.Empty:
                 return
             if event == "refresh_done":
-                context_id, rows, warning, install_result = payload  # type: ignore[misc]
-                self.on_refresh_done(context_id, rows, warning, install_result)
+                context_id, generation, rows, warning, install_result = payload  # type: ignore[misc]
+                self.on_refresh_done(context_id, generation, rows, warning, install_result)
             elif event == "refresh_failed":
-                context_id, error, install_result = payload  # type: ignore[misc]
-                self.on_refresh_failed(context_id, error, install_result)
+                context_id, generation, error, install_result = payload  # type: ignore[misc]
+                self.on_refresh_failed(context_id, generation, error, install_result)
+            elif event == "contexts_done":
+                self.on_contexts_done(payload)  # type: ignore[arg-type]
+            elif event == "contexts_failed":
+                self.on_contexts_failed(str(payload))
+            elif event == "outdated_done":
+                context_id, generation, targets, warning = payload  # type: ignore[misc]
+                self.on_outdated_done(context_id, generation, targets, warning)
+            elif event == "dependency_done":
+                context_id, generation, dependency_payload, error = payload  # type: ignore[misc]
+                self.on_dependency_done(context_id, generation, dependency_payload, error)
             elif event == "install_done":
                 self.on_install_done(payload)  # type: ignore[arg-type]
             elif event == "uv_bootstrap_done":
@@ -993,14 +1058,15 @@ class TuvApp:
     def on_refresh_done(
         self,
         context_id: str,
+        generation: int,
         rows: list[PackageRow],
         warning: str | None,
         install_result: InstallResult | None,
     ) -> None:
+        if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
+            return
         self.refreshing = False
         self.refresh_context_id = None
-        if self.context is None or self.context.id != context_id:
-            return
 
         if install_result is not None:
             self.note_updated_packages(context_id, install_result.before_versions, rows)
@@ -1031,12 +1097,20 @@ class TuvApp:
             else:
                 self.maybe_start_waiting_install()
 
+        context = self.context
+        if context is not None and context.id == context_id and not self.installing:
+            self.start_dependency_refresh(context, generation)
+            self.start_outdated_refresh(context, generation)
+
     def on_refresh_failed(
         self,
         context_id: str,
+        generation: int,
         error: str,
         install_result: InstallResult | None,
     ) -> None:
+        if generation != self.refresh_generation:
+            return
         self.refreshing = False
         self.refresh_context_id = None
         if install_result is not None:
@@ -1049,6 +1123,53 @@ class TuvApp:
                 self.continue_bulk_update()
             else:
                 self.maybe_start_waiting_install()
+
+    def on_outdated_done(
+        self,
+        context_id: str,
+        generation: int,
+        targets: dict[str, str],
+        warning: str | None,
+    ) -> None:
+        if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
+            return
+        self.outdated_loading = False
+        for row in self.rows:
+            latest = targets.get(row.name)
+            if not latest:
+                continue
+            if latest not in row.candidate_versions:
+                row.candidate_versions = sorted(set(row.candidate_versions + [latest]), key=version_key)
+            if (
+                row.target_version == row.installed_version
+                and row.status not in {"failed", "installing", "wait", "loading"}
+            ):
+                row.target_version = latest
+                row.status = "ready" if latest != row.installed_version else "current"
+        if warning:
+            self.message = warning
+        elif targets:
+            self.message = "Latest target versions loaded"
+
+    def on_dependency_done(
+        self,
+        context_id: str,
+        generation: int,
+        dependency_payload: tuple[set[str], dict[str, list[str]], dict[str, list[str]]] | None,
+        error: str | None,
+    ) -> None:
+        if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
+            return
+        self.dependency_loading = False
+        if dependency_payload is None:
+            if error:
+                self.message = f"Dependency data unavailable: {last_lines(error, 2)}"
+            return
+        safe_names, dependency_packages, usage_packages = dependency_payload
+        for row in self.rows:
+            row.uninstall_safe = row.name in safe_names
+            row.dependency_packages = dependency_packages.get(row.name, [])
+            row.usage_packages = usage_packages.get(row.name, [])
 
     def note_updated_packages(
         self,
@@ -1398,7 +1519,10 @@ class TuvApp:
     def handle_context_overlay_key(self, key: str) -> None:
         if key in {"esc", "q", "f9"}:
             self.context_overlay = False
-        elif key == "up":
+            return
+        if not self.contexts:
+            return
+        if key == "up":
             self.context_overlay_index = max(0, self.context_overlay_index - 1)
         elif key == "down":
             self.context_overlay_index = min(len(self.contexts) - 1, self.context_overlay_index + 1)
@@ -1590,6 +1714,8 @@ class TuvApp:
         lines.append(self.separator(width))
         lines.append(self.footer_line(width))
 
+        if self.context_overlay or self.version_overlay or self.info_open or self.prompt:
+            lines = self.dim_background(lines, width)
         if self.context_overlay:
             lines = self.overlay_contexts(lines, width, height)
         if self.version_overlay:
@@ -1606,12 +1732,15 @@ class TuvApp:
 
     def header_line(self, width: int) -> str:
         context = self.context
-        left = f"Context: {context.label if context else '(none)'}"
-        status = "refreshing" if self.refreshing else "idle"
-        if self.installing:
-            status = f"installing {SPINNER[self.spinner_index]}"
-        right = f"Status: {status}"
-        return unframed_join(left, right, width)
+        if context is not None:
+            label = context.label
+        elif self.discovery_error:
+            label = self.discovery_error
+        elif self.discovering_contexts:
+            label = "Discovering Python contexts..."
+        else:
+            label = "Starting..."
+        return truncate(f"[ {label} ]", width).ljust(width)
 
     def table_header(self, width: int) -> str:
         name_w, installed_w, target_w, action_w = self.columns(width)
@@ -1676,6 +1805,9 @@ class TuvApp:
         else:
             keys = "↑/↓ | Pg | ←/→ | ↵ | F2 | F3 | F4 | F9 | F10"
         return truncate(keys, width).ljust(width)
+
+    def dim_background(self, lines: list[str], width: int) -> list[str]:
+        return [MODAL_BACKDROP + strip_ansi(line).ljust(width)[:width] + RESET for line in lines]
 
     def overlay_contexts(self, lines: list[str], width: int, height: int) -> list[str]:
         overlay_w = min(width - 4, max(50, width * 3 // 4))
@@ -1753,8 +1885,7 @@ class TuvApp:
         elif row.status == "failed" and row.last_error_detail:
             body = [
                 f"Package: {row.display_name}",
-                f"Installed: {row.installed_version}",
-                f"Target: {row.target_version}",
+                f"Version: {row.installed_version}",
                 *self.package_relation_lines(row),
                 "",
                 row.last_error or "Install failed",
@@ -1764,10 +1895,7 @@ class TuvApp:
         else:
             body = [
                 f"Package: {row.display_name}",
-                f"Installed: {row.installed_version}",
-                f"Target: {row.target_version}",
-                f"Uninstall-safe marker: {'yes' if row.uninstall_safe else 'no'}",
-                f"Status: {self.display_status(row)}",
+                f"Version: {row.installed_version}",
                 *self.package_relation_lines(row),
             ]
         return self.overlay_text(lines, width, height, "Information", body, scroll_attr="info_scroll")
@@ -1855,8 +1983,21 @@ def paste_box(lines: list[str], box: list[str], top: int, left: int, width: int)
         row_index = top + offset
         if row_index >= len(result):
             break
+        dimmed = result[row_index].startswith(MODAL_BACKDROP)
         raw = strip_ansi(result[row_index]).ljust(width)
-        result[row_index] = raw[:left] + box_line + raw[left + len(strip_ansi(box_line)) :]
+        box_width = len(strip_ansi(box_line))
+        if dimmed:
+            result[row_index] = (
+                MODAL_BACKDROP
+                + raw[:left]
+                + RESET
+                + box_line
+                + MODAL_BACKDROP
+                + raw[left + box_width :]
+                + RESET
+            )
+        else:
+            result[row_index] = raw[:left] + box_line + raw[left + box_width :]
     return result
 
 

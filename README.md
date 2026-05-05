@@ -2,7 +2,15 @@
 
 Tuv is a small alternate-screen terminal UI for managing installed Python packages with `uv`. It discovers Python interpreters and local virtual environments, shows packages in a compact table, lets you choose target versions, and runs installs without leaving the terminal.
 
-![Tuv package table](tuv_demo.png)
+## Demo
+
+Main package table:
+
+![Tuv main package table](tuv_demo_1.png)
+
+Package information dialog:
+
+![Tuv package information dialog](tuv_demo_2.png)
 
 ## Highlights
 
