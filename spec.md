@@ -364,12 +364,18 @@ Bulk update rules:
 - Before starting any install, show a permission dialog summarizing how many ready packages will be installed.
 - The permission dialog must close with `Esc` or a negative answer without starting installs.
 - Bulk update starts only after explicit positive confirmation.
+- If the selected context is an interpreter context that has not yet been confirmed for mutation, the bulk permission dialog must also serve as the interpreter installation confirmation.
+- In that case, the dialog must clearly state that the bulk update will install into the interpreter context; accepting it marks the interpreter context as confirmed for mutation.
 - Build the initial work list from rows whose normalized package name is unique, whose status is `ready`, and whose `updated_in_session` flag is false.
 - Run installs sequentially with the same asynchronous worker used for single-package installs.
 - Never start more than one uv install process at a time.
 - After each package install exits, refresh the full package table before choosing the next package.
 - Before starting each next package, re-check the refreshed row state.
 - Skip a package when it is already current, no longer ready, already installed or updated during the current session, or already processed in this bulk update run.
+- For the initial bulk work list, each queued package keeps its planned target version for the duration of that bulk run.
+- If a queued package was modified earlier in the same bulk run as a dependency of another install, do not treat that as completing the queued package unless its installed version now equals the queued target version.
+- Every planned bulk update must still be executed to its queued target version when its turn arrives, regardless of dependency-side modifications made by earlier installs.
+- If a package installation fails during a bulk update, keep that package in `failed` status and do not retry it during the same bulk update run.
 - Mark the active row as `installing`; mark pending bulk rows as `wait` if they are visible.
 - Keep the TUI responsive throughout the bulk update.
 
@@ -625,3 +631,5 @@ These examples describe behavior that must be treated as bugs and covered by reg
 - Large information dialog content is not scrollable as expected.
 - In the version selector, moving selection down scrolls the entire content upward while the selection marker stays at the top; the marker should move down until it reaches the visible selector boundary.
 - Tuv takes 1 second to start and show the initial screen; this is not acceptable because the first visual frame must be established in less than 100 ms.
+- Tuv emits sounds, such as terminal beeps; this should never happen.
+- Pressing `F2` starts installation of one package but then does not proceed with the rest of the packages that were previously waiting.

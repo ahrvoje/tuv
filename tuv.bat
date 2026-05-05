@@ -17,6 +17,13 @@ if not exist "%REQ%" (
   exit /b 1
 )
 
+if not exist "%RUNNER%\Scripts\python.exe" goto after_fast_args
+if "%~1"=="--version" goto run_existing_runner
+if "%~1"=="--help" goto run_existing_runner
+if "%~1"=="-h" goto run_existing_runner
+
+:after_fast_args
+
 set "FIND_PS=%TEMP%\tuv-find-python-%RANDOM%-%RANDOM%.ps1"
 > "%FIND_PS%" echo $ErrorActionPreference = 'SilentlyContinue'
 >> "%FIND_PS%" echo $c = @()
@@ -38,17 +45,21 @@ if not defined NEWEST_PYTHON (
 )
 
 "%NEWEST_PYTHON%" -m uv --version >nul 2>nul
-if errorlevel 1 (
-  choice /M "uv is missing from %NEWEST_PYTHON%. Install uv into this Python"
-  if errorlevel 2 (
-    echo uv is required to run Tuv. 1>&2
-    exit /b 1
-  )
-  "%NEWEST_PYTHON%" -m pip --version >nul 2>nul
-  if errorlevel 1 "%NEWEST_PYTHON%" -m ensurepip --upgrade
-  "%NEWEST_PYTHON%" -m pip install uv
-  if errorlevel 1 exit /b 1
-)
+if not errorlevel 1 goto uv_ready
+set "UV_INSTALL="
+set /p "UV_INSTALL=uv is missing from %NEWEST_PYTHON%. Install uv into this Python? [y/N] "
+if /I "%UV_INSTALL%"=="Y" goto install_uv
+if /I "%UV_INSTALL%"=="YES" goto install_uv
+echo uv is required to run Tuv. 1>&2
+exit /b 1
+
+:install_uv
+"%NEWEST_PYTHON%" -m pip --version >nul 2>nul
+if errorlevel 1 "%NEWEST_PYTHON%" -m ensurepip --upgrade
+"%NEWEST_PYTHON%" -m pip install uv
+if errorlevel 1 exit /b 1
+
+:uv_ready
 
 if not exist "%RUNNER%\Scripts\python.exe" (
   "%NEWEST_PYTHON%" -m uv venv --allow-existing --python "%NEWEST_PYTHON%" "%RUNNER%"
@@ -69,3 +80,8 @@ if not "%REQ_HASH%"=="%STATE_HASH%" (
 
 set "TUV_HOME=%TUV_HOME%"
 "%RUNNER%\Scripts\python.exe" "%APP%" %*
+exit /b %ERRORLEVEL%
+
+:run_existing_runner
+"%RUNNER%\Scripts\python.exe" "%APP%" %*
+exit /b %ERRORLEVEL%

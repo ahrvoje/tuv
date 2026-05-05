@@ -664,6 +664,7 @@ class Terminal:
             kernel32.SetConsoleMode(handle, mode.value | 0x0004)
 
     def write(self, text: str) -> None:
+        text = text.replace("\a", "")
         sys.stdout.write(text)
         sys.stdout.flush()
 
@@ -800,6 +801,7 @@ class TuvApp:
         self.bulk_active = False
         self.bulk_queue: list[tuple[str, str]] = []
         self.bulk_processed: set[str] = set()
+        self.bulk_failed_results: dict[str, InstallResult] = {}
         self.prompt: Prompt | None = None
         self.info_open = False
         self.info_scroll = 0
@@ -900,6 +902,7 @@ class TuvApp:
         self.bulk_active = False
         self.bulk_queue = []
         self.bulk_processed = set()
+        self.bulk_failed_results = {}
         self.outdated_loading = False
         self.dependency_loading = False
         self.info_open = False
@@ -1077,6 +1080,7 @@ class TuvApp:
         self.rows = rows
         self.focus_index = min(self.focus_index, max(0, len(self.rows) - 1))
         self.scroll = min(self.scroll, max(0, len(self.rows) - 1))
+        self.restore_bulk_failed_rows()
 
         if install_result is not None:
             self.installing = False
@@ -1171,6 +1175,12 @@ class TuvApp:
             row.dependency_packages = dependency_packages.get(row.name, [])
             row.usage_packages = usage_packages.get(row.name, [])
 
+    def restore_bulk_failed_rows(self) -> None:
+        if not self.bulk_failed_results:
+            return
+        for result in self.bulk_failed_results.values():
+            self.apply_failed_result_to_row(result)
+
     def note_updated_packages(
         self,
         context_id: str,
@@ -1184,6 +1194,12 @@ class TuvApp:
                 changed.add(row.name)
 
     def mark_failed_row(self, result: InstallResult) -> None:
+        if self.bulk_active:
+            self.bulk_failed_results[result.package_name] = result
+            self.bulk_processed.add(result.package_name)
+        self.apply_failed_result_to_row(result)
+
+    def apply_failed_result_to_row(self, result: InstallResult) -> None:
         detail = command_detail(
             result.command,
             result.returncode,
@@ -1251,26 +1267,52 @@ class TuvApp:
         if not queue_items:
             self.message = "No ready packages to update"
             return
+        title = "Confirm update all"
+        message = f"Install updates for {len(queue_items)} ready package(s)? y/N"
+        if context.type == "interpreter" and not context.confirmed_for_mutation:
+            title = "Confirm interpreter update all"
+            message = (
+                f"Install updates for {len(queue_items)} ready package(s) into interpreter "
+                f"{context.python_path}? y/N"
+            )
         self.prompt = Prompt(
-            title="Confirm update all",
-            message=f"Install updates for {len(queue_items)} ready package(s)? y/N",
-            on_yes=lambda items=queue_items: self.confirm_bulk_update(items),
+            title=title,
+            message=message,
+            on_yes=lambda items=queue_items, selected_context=context: self.confirm_bulk_update(items, selected_context),
             on_no=lambda: setattr(self, "message", "Update all cancelled"),
         )
 
-    def confirm_bulk_update(self, queue_items: list[tuple[str, str]]) -> None:
+    def confirm_bulk_update(
+        self,
+        queue_items: list[tuple[str, str]],
+        confirmed_context: PythonContext | None = None,
+    ) -> None:
         self.prompt = None
+        context = self.context
+        if (
+            confirmed_context is not None
+            and context is not None
+            and context.id == confirmed_context.id
+            and context.type == "interpreter"
+        ):
+            context.confirmed_for_mutation = True
         self.bulk_active = True
         self.bulk_queue = list(queue_items)
         self.bulk_processed = set()
+        self.bulk_failed_results = {}
         self.mark_bulk_pending_waits()
         self.message = f"Updating {len(queue_items)} ready packages"
         self.continue_bulk_update()
 
     def mark_bulk_pending_waits(self) -> None:
-        pending = {name for name, _target in self.bulk_queue}
+        pending = {name: target for name, target in self.bulk_queue}
         for row in self.rows:
-            if row.name in pending and row.status == "ready":
+            target = pending.get(row.name)
+            if (
+                target is not None
+                and row.installed_version != target
+                and row.status not in {"installing", "failed"}
+            ):
                 row.status = "wait"
 
     def continue_bulk_update(self) -> None:
@@ -1284,9 +1326,10 @@ class TuvApp:
                 self.bulk_processed.add(normalized)
                 continue
             if normalized in self.bulk_processed:
-                row.status = "skipped"
+                if row.status != "failed":
+                    row.status = "skipped"
                 continue
-            if row.updated_in_session or row.installed_version == target_version or row.status not in {"ready", "wait"}:
+            if row.installed_version == target_version or row.status in {"failed", "installing"}:
                 row.status = "skipped" if row.status not in {"current", "failed"} else row.status
                 self.bulk_processed.add(normalized)
                 continue
@@ -1299,6 +1342,7 @@ class TuvApp:
             return
         self.bulk_active = False
         self.bulk_processed = set()
+        self.bulk_failed_results = {}
         self.message = "Update all complete"
         self.maybe_start_waiting_install()
 
