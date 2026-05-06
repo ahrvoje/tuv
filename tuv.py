@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import shutil
@@ -32,7 +34,7 @@ except Exception:  # pragma: no cover - runner requirements should provide packa
 
 IS_WINDOWS = os.name == "nt"
 TUV_HOME = Path(os.environ.get("TUV_HOME", Path(__file__).resolve().parent)).resolve()
-RUNNER_VENV = TUV_HOME / ".tuv-venv"
+RUNNER_VENV = Path(os.environ.get("TUV_RUNNER_VENV", TUV_HOME / ".tuv-venv")).resolve()
 
 ALT_ON = "\x1b[?1049h"
 ALT_OFF = "\x1b[?1049l"
@@ -58,6 +60,11 @@ class PythonInfo:
     version: tuple[int, int, int]
     prefix: str = ""
     base_prefix: str = ""
+    base_executable: str = ""
+    implementation: str = ""
+    architecture: str = ""
+    os_name: str = ""
+    source: str = "installed"
 
     @property
     def version_text(self) -> str:
@@ -65,14 +72,35 @@ class PythonInfo:
 
 
 @dataclass
+class UvProvider:
+    type: str
+    executable: Path | None
+    python_path: Path | None
+    priority: int
+    version: str
+
+    @property
+    def command_prefix(self) -> list[str]:
+        if self.type == "standalone":
+            if self.executable is None:
+                raise RuntimeError("Standalone uv provider has no executable path")
+            return [str(self.executable)]
+        if self.python_path is None:
+            raise RuntimeError("Module uv provider has no Python path")
+        return [str(self.python_path), "-m", "uv"]
+
+
+@dataclass
 class PythonContext:
     id: str
     type: str
+    source: str
     label: str
     python_path: Path
+    reference_python_path: Path | None
     root_path: Path | None
     version: str
-    uv_available: bool
+    resolved_uv_provider: UvProvider | None = None
     confirmed_for_mutation: bool = False
 
     @property
@@ -84,6 +112,10 @@ class PythonContext:
     @property
     def is_virtual(self) -> bool:
         return self.type in {"tuv", "active", "venv"}
+
+    @property
+    def uv_manageable(self) -> bool:
+        return self.resolved_uv_provider is not None
 
 
 @dataclass
@@ -172,7 +204,146 @@ def run_command(args: list[str], timeout: float | None = None) -> subprocess.Com
     )
 
 
-def probe_python(executable: str | Path, timeout: float = 3.0) -> PythonInfo | None:
+def uv_version_text(output: str) -> str:
+    first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    return first_line or "unknown"
+
+
+def validate_uv_command(command: list[str], timeout: float = 5.0) -> str | None:
+    try:
+        proc = run_command([*command, "--version"], timeout=timeout)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return uv_version_text(proc.stdout or proc.stderr)
+
+
+def path_key(path: Path) -> str:
+    resolved = path.resolve()
+    return str(resolved).lower() if IS_WINDOWS else str(resolved)
+
+
+def resolve_file_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    text = str(value).strip().strip('"')
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_file():
+        resolved = shutil.which(text)
+        if not resolved:
+            return None
+        path = Path(resolved)
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def runner_python_path() -> Path:
+    env_path = resolve_file_path(os.environ.get("TUV_RUNNER_PYTHON"))
+    if env_path is not None:
+        return env_path
+    return venv_python(RUNNER_VENV).resolve()
+
+
+def python_uv_provider(provider_type: str, python_path: Path | None, priority: int) -> UvProvider | None:
+    if python_path is None or not python_path.is_file():
+        return None
+    try:
+        python_path = python_path.resolve()
+    except OSError:
+        return None
+    version = validate_uv_command([str(python_path), "-m", "uv"])
+    if not version:
+        return None
+    return UvProvider(provider_type, None, python_path, priority, version)
+
+
+def standalone_uv_provider(priority: int = 3) -> UvProvider | None:
+    candidates: list[str | Path] = []
+    env_value = os.environ.get("TUV_SYSTEM_UV_EXE")
+    if env_value:
+        candidates.append(env_value)
+    resolved = shutil.which("uv")
+    if resolved:
+        candidates.append(resolved)
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = resolve_file_path(candidate)
+        if path is None:
+            continue
+        key = path_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        version = validate_uv_command([str(path)])
+        if version:
+            return UvProvider("standalone", path, None, priority, version)
+    return None
+
+
+def runner_uv_provider(priority: int = 4) -> UvProvider | None:
+    return python_uv_provider("tuv", runner_python_path(), priority)
+
+
+def provider_label(provider: UvProvider | None) -> str:
+    if provider is None:
+        return "unavailable"
+    labels = {
+        "context_venv": "venv uv",
+        "reference_python": "ref uv",
+        "standalone": "system uv",
+        "tuv": "tuv uv",
+    }
+    return labels.get(provider.type, provider.type)
+
+
+def resolve_uv_provider(context: PythonContext) -> UvProvider | None:
+    checked_python: set[str] = set()
+
+    if context.is_virtual and context.type != "tuv":
+        checked_python.add(path_key(context.python_path))
+        provider = python_uv_provider("context_venv", context.python_path, 1)
+        if provider is not None:
+            return provider
+
+    reference = context.reference_python_path
+    if context.type == "interpreter":
+        reference = context.python_path
+    if reference is not None:
+        key = path_key(reference)
+        if key not in checked_python:
+            checked_python.add(key)
+            provider = python_uv_provider("reference_python", reference, 2)
+            if provider is not None:
+                return provider
+
+    provider = standalone_uv_provider()
+    if provider is not None:
+        return provider
+
+    return runner_uv_provider()
+
+
+def refresh_context_uv_provider(context: PythonContext) -> UvProvider | None:
+    context.resolved_uv_provider = resolve_uv_provider(context)
+    return context.resolved_uv_provider
+
+
+def uv_command(context: PythonContext, args: list[str]) -> list[str]:
+    provider = refresh_context_uv_provider(context)
+    if provider is None:
+        raise RuntimeError(
+            "No uv provider is available. Tuv can install uv into the Tuv runner venv, "
+            "but it will not install uv into the selected context."
+        )
+    return [*provider.command_prefix, *args]
+
+
+def probe_python(executable: str | Path, timeout: float = 3.0, source: str = "installed") -> PythonInfo | None:
     path = Path(str(executable).strip().strip('"'))
     if not path:
         return None
@@ -182,10 +353,14 @@ def probe_python(executable: str | Path, timeout: float = 3.0) -> PythonInfo | N
             return None
         path = Path(resolved)
     code = (
-        "import json, sys; "
+        "import json, platform, sys; "
         "print(json.dumps({'version': sys.version_info[:3], "
         "'executable': sys.executable, 'prefix': sys.prefix, "
-        "'base_prefix': sys.base_prefix}))"
+        "'base_prefix': sys.base_prefix, "
+        "'base_executable': getattr(sys, '_base_executable', None), "
+        "'implementation': sys.implementation.name, "
+        "'architecture': platform.machine(), "
+        "'os_name': sys.platform}))"
     )
     try:
         proc = run_command([str(path), "-c", code], timeout=timeout)
@@ -203,6 +378,54 @@ def probe_python(executable: str | Path, timeout: float = 3.0) -> PythonInfo | N
             version=version,  # type: ignore[arg-type]
             prefix=str(data.get("prefix", "")),
             base_prefix=str(data.get("base_prefix", "")),
+            base_executable=str(data.get("base_executable") or ""),
+            implementation=str(data.get("implementation", "")),
+            architecture=str(data.get("architecture", "")),
+            os_name=str(data.get("os_name", "")),
+            source=source,
+        )
+    except Exception:
+        return None
+
+
+def probe_runner_python(executable: str | Path, timeout: float = 5.0, source: str = "installed") -> PythonInfo | None:
+    path = Path(str(executable).strip().strip('"'))
+    if not path.is_file():
+        resolved = shutil.which(str(path))
+        if not resolved:
+            return None
+        path = Path(resolved)
+    code = (
+        "import json, platform, sys, venv; "
+        "print(json.dumps({'version': sys.version_info[:3], "
+        "'executable': sys.executable, 'prefix': sys.prefix, "
+        "'base_prefix': sys.base_prefix, "
+        "'base_executable': getattr(sys, '_base_executable', None), "
+        "'implementation': sys.implementation.name, "
+        "'architecture': platform.machine(), "
+        "'os_name': sys.platform}))"
+    )
+    try:
+        proc = run_command([str(path), "-c", code], timeout=timeout)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+        version = tuple(int(part) for part in data["version"])
+        if len(version) != 3:
+            return None
+        return PythonInfo(
+            executable=Path(data["executable"]).resolve(),
+            version=version,  # type: ignore[arg-type]
+            prefix=str(data.get("prefix", "")),
+            base_prefix=str(data.get("base_prefix", "")),
+            base_executable=str(data.get("base_executable") or ""),
+            implementation=str(data.get("implementation", "")),
+            architecture=str(data.get("architecture", "")),
+            os_name=str(data.get("os_name", "")),
+            source=source,
         )
     except Exception:
         return None
@@ -320,15 +543,56 @@ def posix_python_candidates() -> list[Path]:
     return paths
 
 
+def cwd_python_candidates(cwd: Path | None = None, allow_venv: bool = False) -> list[Path]:
+    cwd = (cwd or Path.cwd()).resolve()
+    if (cwd / "pyvenv.cfg").is_file():
+        return [venv_python(cwd)] if allow_venv and venv_python(cwd).is_file() else []
+    if IS_WINDOWS:
+        relative_candidates = ["python.exe", "python3.exe", "Scripts/python.exe", "bin/python.exe"]
+    else:
+        relative_candidates = ["python", "python3", "bin/python", "bin/python3"]
+    return [cwd / relative for relative in relative_candidates if (cwd / relative).is_file()]
+
+
+def launcher_python_candidates() -> list[Path]:
+    newest = resolve_file_path(os.environ.get("TUV_NEWEST_PYTHON"))
+    return [newest] if newest is not None else []
+
+
 def discover_python_infos() -> list[PythonInfo]:
-    raw_candidates = windows_python_candidates() if IS_WINDOWS else posix_python_candidates()
+    installed_candidates = windows_python_candidates() if IS_WINDOWS else posix_python_candidates()
+    raw_candidates = (
+        [(candidate, "cwd") for candidate in cwd_python_candidates()]
+        + [(candidate, "installed") for candidate in launcher_python_candidates()]
+        + [(candidate, "installed") for candidate in installed_candidates]
+    )
     seen: set[str] = set()
     infos: list[PythonInfo] = []
-    for candidate in raw_candidates:
-        info = probe_python(candidate)
+    by_key: dict[str, PythonInfo] = {}
+    for candidate, source in raw_candidates:
+        info = probe_python(candidate, source=source)
         if info is None:
             continue
         key = str(info.executable).lower() if IS_WINDOWS else str(info.executable)
+        if key in seen:
+            if source == "cwd":
+                by_key[key].source = "cwd"
+            continue
+        seen.add(key)
+        by_key[key] = info
+        infos.append(info)
+    infos.sort(key=lambda item: item.version, reverse=True)
+    return infos
+
+
+def sorted_runner_infos(candidates: Iterable[Path], source: str) -> list[PythonInfo]:
+    seen: set[str] = set()
+    infos: list[PythonInfo] = []
+    for candidate in candidates:
+        info = probe_runner_python(candidate, source=source)
+        if info is None:
+            continue
+        key = path_key(info.executable)
         if key in seen:
             continue
         seen.add(key)
@@ -337,81 +601,283 @@ def discover_python_infos() -> list[PythonInfo]:
     return infos
 
 
-def has_uv(python_path: Path, timeout: float = 5.0) -> bool:
+def select_runner_python(mode: str) -> PythonInfo:
+    cwd = Path.cwd()
+    if mode == "cwd":
+        infos = sorted_runner_infos(cwd_python_candidates(cwd, allow_venv=True), "cwd")
+        if not infos:
+            raise RuntimeError(f"No usable current-working-directory Python was found in {cwd}")
+        return infos[0]
+
+    platform_candidates = windows_python_candidates() if IS_WINDOWS else posix_python_candidates()
+    platform_infos = sorted_runner_infos(platform_candidates, "installed")
+    if platform_infos:
+        return platform_infos[0]
+
+    cwd_infos = sorted_runner_infos(cwd_python_candidates(cwd, allow_venv=False), "cwd")
+    if cwd_infos:
+        return cwd_infos[0]
+    raise RuntimeError("No usable Python interpreter was found.")
+
+
+def runner_compatibility_key(info: PythonInfo, mode: str) -> str:
+    parts = [
+        path_key(info.executable),
+        info.version_text,
+        info.implementation,
+        info.architecture,
+        info.os_name,
+        mode,
+    ]
+    return "|".join(parts)
+
+
+def runner_hash(key: str, length: int = 8) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:length]
+
+
+def read_runner_state(root: Path) -> dict[str, str]:
+    state = root / ".tuv-runner-state"
+    data: dict[str, str] = {}
     try:
-        proc = run_command([str(python_path), "-m", "uv", "--version"], timeout=timeout)
-        return proc.returncode == 0
+        for line in state.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                data[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return data
+
+
+def write_runner_state(root: Path, info: PythonInfo, mode: str, key: str, hash_value: str) -> None:
+    state = root / ".tuv-runner-state"
+    lines = [
+        f"base_python={info.executable}",
+        f"base_version={info.version_text}",
+        f"compat_key={key}",
+        f"compat_hash={hash_value}",
+        f"launcher_mode={mode}",
+        f"timestamp={time.strftime('%Y%m%d%H%M%S', time.gmtime())}",
+    ]
+    state.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def runner_python_ok(python_path: Path) -> bool:
+    if not python_path.is_file():
+        return False
+    code = (
+        "import os, sys; "
+        "base = getattr(sys, '_base_executable', '') or ''; "
+        "raise SystemExit(0 if (not base or os.path.exists(base)) else 1)"
+    )
+    try:
+        proc = run_command([str(python_path), "-c", code], timeout=10)
     except Exception:
         return False
+    return proc.returncode == 0 and probe_python(python_path, timeout=5, source="tuv") is not None
 
 
-def install_uv_command(python_path: Path) -> tuple[list[str], list[str]]:
-    ensurepip = [str(python_path), "-m", "ensurepip", "--upgrade"]
-    install = [str(python_path), "-m", "pip", "install", "uv"]
-    return ensurepip, install
+def runner_venv_compatible(root: Path, key: str) -> bool:
+    try:
+        root = root.resolve()
+    except OSError:
+        return False
+    if root.parent != TUV_HOME:
+        return False
+    if not (root.name.startswith("tuv-venv-") or root.name == ".tuv-venv"):
+        return False
+    state = read_runner_state(root)
+    if state.get("compat_key") != key:
+        return False
+    base_python = state.get("base_python", "")
+    if not base_python or not Path(base_python).is_file():
+        return False
+    return runner_python_ok(venv_python(root))
 
 
-def context_from_venv(context_type: str, root: Path, label_prefix: str) -> PythonContext | None:
+def runner_venv_candidates() -> list[Path]:
+    candidates = list(TUV_HOME.glob("tuv-venv-*"))
+    legacy = TUV_HOME / ".tuv-venv"
+    if legacy.is_dir():
+        candidates.append(legacy)
+    return [path for path in candidates if path.is_dir()]
+
+
+def find_compatible_runner_venv(key: str) -> Path | None:
+    compatible: list[tuple[str, str, Path]] = []
+    for root in runner_venv_candidates():
+        if not runner_venv_compatible(root, key):
+            continue
+        state = read_runner_state(root)
+        compatible.append((state.get("timestamp", ""), root.name, root.resolve()))
+    if not compatible:
+        return None
+    compatible.sort(reverse=True)
+    return compatible[0][2]
+
+
+def new_runner_venv_path(key: str) -> tuple[Path, str]:
+    hash_value = runner_hash(key)
+    candidate = TUV_HOME / f"tuv-venv-{hash_value}"
+    if not candidate.exists():
+        return candidate, hash_value
+    for counter in range(100):
+        seed = f"{key}|{time.time_ns()}|{counter}"
+        hash_value = runner_hash(seed)
+        candidate = TUV_HOME / f"tuv-venv-{hash_value}"
+        if not candidate.exists():
+            return candidate, hash_value
+    raise RuntimeError("Could not allocate a unique Tuv runner venv path")
+
+
+def prepare_runner_environment(mode: str) -> tuple[PythonInfo, Path]:
+    if mode not in {"default", "cwd"}:
+        raise RuntimeError(f"Unsupported launcher mode: {mode}")
+    info = select_runner_python(mode)
+    key = runner_compatibility_key(info, mode)
+    runner = find_compatible_runner_venv(key)
+    if runner is not None:
+        return info, runner
+
+    runner, hash_value = new_runner_venv_path(key)
+    proc = run_command([str(info.executable), "-m", "venv", str(runner)], timeout=None)
+    if proc.returncode != 0:
+        detail = command_detail([str(info.executable), "-m", "venv", str(runner)], proc.returncode, proc.stdout, proc.stderr, 0)
+        raise RuntimeError(detail)
+    write_runner_state(runner, info, mode, key, hash_value)
+    return info, runner
+
+
+def print_prepare_runner(mode: str) -> int:
+    try:
+        info, runner = prepare_runner_environment(mode)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"TUV_NEWEST_PYTHON={info.executable}")
+    print(f"TUV_RUNNER_VENV={runner}")
+    print(f"TUV_RUNNER_PYTHON={venv_python(runner)}")
+    return 0
+
+
+def read_pyvenv_home(root: Path) -> str | None:
+    cfg = root / "pyvenv.cfg"
+    try:
+        for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip().lower() == "home":
+                home = value.strip()
+                return home or None
+    except OSError:
+        return None
+    return None
+
+
+def python_paths_from_location(location: str | Path) -> list[Path]:
+    path = Path(str(location).strip().strip('"'))
+    if path.is_file():
+        return [path]
+    if IS_WINDOWS:
+        names = ["python.exe", "python3.exe", "Scripts/python.exe"]
+    else:
+        names = ["python", "python3", "bin/python", "bin/python3"]
+    return [path / name for name in names]
+
+
+def resolve_venv_reference_python(root: Path, info: PythonInfo) -> Path | None:
+    candidates: list[Path] = []
+    if info.base_executable:
+        candidates.append(Path(info.base_executable))
+    home = read_pyvenv_home(root)
+    if home:
+        candidates.extend(python_paths_from_location(home))
+    if info.base_prefix:
+        candidates.extend(python_paths_from_location(info.base_prefix))
+
+    seen: set[str] = {path_key(info.executable)}
+    for candidate in candidates:
+        probed = probe_python(candidate)
+        if probed is None:
+            continue
+        key = path_key(probed.executable)
+        if key in seen:
+            continue
+        return probed.executable
+    return None
+
+
+def context_from_venv(context_type: str, root: Path, label_prefix: str, source: str) -> PythonContext | None:
     if not is_venv(root):
         return None
     info = probe_python(venv_python(root))
     if info is None:
         return None
     label = f"{label_prefix} - Python {info.version_text} - {root}"
-    return PythonContext(
+    context = PythonContext(
         id=stable_context_id(context_type, root),
         type=context_type,
+        source=source,
         label=label,
         python_path=info.executable,
+        reference_python_path=resolve_venv_reference_python(root, info),
         root_path=root.resolve(),
         version=info.version_text,
-        uv_available=has_uv(info.executable),
     )
+    refresh_context_uv_provider(context)
+    return context
 
 
 def discover_contexts() -> list[PythonContext]:
-    contexts: list[PythonContext] = []
+    interpreter_contexts: list[PythonContext] = []
+    venv_contexts: list[PythonContext] = []
+    tuv_contexts: list[PythonContext] = []
     seen: set[str] = set()
 
-    def add(context: PythonContext | None) -> None:
+    def add(target: list[PythonContext], context: PythonContext | None) -> None:
         if context is None:
             return
         if context.id in seen:
             return
         seen.add(context.id)
-        contexts.append(context)
+        target.append(context)
+
+    for info in discover_python_infos():
+        prefix = "cwd interpreter" if info.source == "cwd" else "interpreter"
+        label = f"{prefix} - Python {info.version_text} - {info.executable}"
+        context = PythonContext(
+            id=stable_context_id("interpreter", info.executable),
+            type="interpreter",
+            source=info.source,
+            label=label,
+            python_path=info.executable,
+            reference_python_path=info.executable,
+            root_path=None,
+            version=info.version_text,
+        )
+        refresh_context_uv_provider(context)
+        add(
+            interpreter_contexts,
+            context,
+        )
 
     active = os.environ.get("VIRTUAL_ENV")
     if active:
-        add(context_from_venv("active", Path(active), "active venv"))
-
-    add(context_from_venv("tuv", RUNNER_VENV, "tuv venv"))
+        add(venv_contexts, context_from_venv("active", Path(active), "active venv", "active"))
 
     cwd = Path.cwd()
     if is_venv(cwd):
-        add(context_from_venv("venv", cwd, cwd.name or str(cwd)))
+        add(venv_contexts, context_from_venv("venv", cwd, cwd.name or str(cwd), "cwd"))
     for child in sorted((item for item in cwd.iterdir() if item.is_dir()), key=lambda p: p.name.lower()):
-        add(context_from_venv("venv", child, child.name))
+        if child.resolve() == RUNNER_VENV:
+            continue
+        add(venv_contexts, context_from_venv("venv", child, child.name, "scanned"))
 
-    for info in discover_python_infos():
-        label = f"interpreter - Python {info.version_text} - {info.executable}"
-        add(
-            PythonContext(
-                id=stable_context_id("interpreter", info.executable),
-                type="interpreter",
-                label=label,
-                python_path=info.executable,
-                root_path=None,
-                version=info.version_text,
-                uv_available=has_uv(info.executable),
-            )
-        )
-
-    return contexts
+    add(tuv_contexts, context_from_venv("tuv", RUNNER_VENV, "tuv venv", "tuv"))
+    return interpreter_contexts + venv_contexts + tuv_contexts
 
 
 def run_uv_json(context: PythonContext, args: list[str], timeout: float | None = 90.0) -> tuple[object, str]:
-    cmd = [str(context.python_path), "-m", "uv", *args]
+    cmd = uv_command(context, args)
     proc = run_command(cmd, timeout=timeout)
     if proc.returncode != 0:
         detail = command_detail(cmd, proc.returncode, proc.stdout, proc.stderr, 0)
@@ -878,12 +1344,21 @@ class TuvApp:
         self.should_quit = True
 
     def default_context_index(self) -> int:
-        for preferred in ("active", "venv", "tuv", "interpreter"):
-            for index, context in enumerate(self.contexts):
-                if preferred == "venv" and context.root_path and context.root_path.name == ".venv":
-                    return index
-                if context.type == preferred and preferred != "venv":
-                    return index
+        for index, context in enumerate(self.contexts):
+            if context.type == "active":
+                return index
+        for index, context in enumerate(self.contexts):
+            if context.type == "venv" and context.root_path and context.root_path.name == ".venv":
+                return index
+        for index, context in enumerate(self.contexts):
+            if context.type == "interpreter" and context.source == "cwd":
+                return index
+        for index, context in enumerate(self.contexts):
+            if context.type == "interpreter":
+                return index
+        for index, context in enumerate(self.contexts):
+            if context.type == "tuv":
+                return index
         return 0
 
     def load_current_context(self) -> None:
@@ -908,44 +1383,38 @@ class TuvApp:
         self.info_open = False
         self.info_scroll = 0
         self.message = f"Loading {context.label}"
-        self.ensure_uv(context, lambda: self.start_refresh(context, "Loading packages"))
+        self.ensure_uv_provider(context, lambda: self.start_refresh(context, "Loading packages"))
 
-    def ensure_uv(self, context: PythonContext, on_ready: Callable[[], None]) -> None:
-        if context.uv_available:
+    def ensure_uv_provider(self, context: PythonContext, on_ready: Callable[[], None]) -> None:
+        if refresh_context_uv_provider(context) is not None:
             on_ready()
             return
+        self.bootstrap_tuv_runner_uv(context, on_ready)
 
-        def yes() -> None:
-            self.prompt = None
-            self.bootstrap_uv(context, on_ready)
-
-        def no() -> None:
-            self.prompt = None
-            self.message = f"uv is required for {context.label}"
-
-        self.prompt = Prompt(
-            title="Install uv?",
-            message=f"uv is missing from {context.python_path}. Install uv into this Python? y/N",
-            on_yes=yes,
-            on_no=no,
-        )
-
-    def bootstrap_uv(self, context: PythonContext, on_ready: Callable[[], None]) -> None:
-        self.message = f"Installing uv into {context.python_path}"
+    def bootstrap_tuv_runner_uv(self, context: PythonContext, on_ready: Callable[[], None]) -> None:
+        runner = runner_python_path()
+        self.message = f"Installing uv into Tuv runner venv: {runner}"
 
         def worker() -> None:
-            ensurepip, install = install_uv_command(context.python_path)
             try:
-                pip_check = run_command([str(context.python_path), "-m", "pip", "--version"], timeout=15)
+                if not runner.is_file():
+                    raise RuntimeError(f"Tuv runner Python was not found: {runner}")
+                pip_check = run_command([str(runner), "-m", "pip", "--version"], timeout=20)
                 if pip_check.returncode != 0:
-                    run_command(ensurepip, timeout=120)
+                    ensurepip = [str(runner), "-m", "ensurepip", "--upgrade"]
+                    ensure = run_command(ensurepip, timeout=120)
+                    if ensure.returncode != 0:
+                        detail = command_detail(ensurepip, ensure.returncode, ensure.stdout, ensure.stderr, 0)
+                        self.event_queue.put(("runner_uv_done", (context.id, 1, detail, on_ready)))
+                        return
+                install = [str(runner), "-m", "pip", "install", "uv"]
                 start = time.time()
                 proc = run_command(install, timeout=300)
                 elapsed = time.time() - start
                 detail = command_detail(install, proc.returncode, proc.stdout, proc.stderr, elapsed)
-                self.event_queue.put(("uv_bootstrap_done", (context.id, proc.returncode, detail, on_ready)))
+                self.event_queue.put(("runner_uv_done", (context.id, proc.returncode, detail, on_ready)))
             except Exception as exc:
-                self.event_queue.put(("uv_bootstrap_done", (context.id, 1, str(exc), on_ready)))
+                self.event_queue.put(("runner_uv_done", (context.id, 1, str(exc), on_ready)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1020,14 +1489,14 @@ class TuvApp:
                 self.on_dependency_done(context_id, generation, dependency_payload, error)
             elif event == "install_done":
                 self.on_install_done(payload)  # type: ignore[arg-type]
-            elif event == "uv_bootstrap_done":
+            elif event == "runner_uv_done":
                 context_id, returncode, detail, on_ready = payload  # type: ignore[misc]
-                self.on_uv_bootstrap_done(context_id, returncode, detail, on_ready)
+                self.on_runner_uv_done(context_id, returncode, detail, on_ready)
             elif event == "versions_done":
                 row_name, versions, error = payload  # type: ignore[misc]
                 self.on_versions_done(row_name, versions, error)
 
-    def on_uv_bootstrap_done(
+    def on_runner_uv_done(
         self,
         context_id: str,
         returncode: int,
@@ -1037,26 +1506,27 @@ class TuvApp:
         context = self.find_context(context_id)
         if context is None:
             return
-        if returncode == 0:
-            context.uv_available = True
-            self.message = "uv installed"
+        for candidate in self.contexts:
+            refresh_context_uv_provider(candidate)
+        if returncode == 0 and refresh_context_uv_provider(context) is not None:
+            self.message = "uv installed into Tuv runner venv"
             on_ready()
-        else:
-            self.message = "uv installation failed"
-            self.info_open = True
-            self.rows = [
-                PackageRow(
-                    name="uv",
-                    display_name="uv bootstrap",
-                    uninstall_safe=False,
-                    installed_version="-",
-                    target_version="-",
-                    candidate_versions=["-"],
-                    status="failed",
-                    last_error="uv installation failed",
-                    last_error_detail=detail,
-                )
-            ]
+            return
+        self.message = "Tuv runner uv installation failed"
+        self.info_open = True
+        self.rows = [
+            PackageRow(
+                name="uv",
+                display_name="uv bootstrap",
+                uninstall_safe=False,
+                installed_version="-",
+                target_version="-",
+                candidate_versions=["-"],
+                status="failed",
+                last_error="Tuv runner uv installation failed",
+                last_error_detail=detail,
+            )
+        ]
 
     def on_refresh_done(
         self,
@@ -1253,8 +1723,8 @@ class TuvApp:
         context = self.context
         if context is None:
             return
-        if not context.uv_available:
-            self.ensure_uv(context, self.start_bulk_update)
+        if refresh_context_uv_provider(context) is None:
+            self.ensure_uv_provider(context, self.start_bulk_update)
             return
         seen: set[str] = set()
         queue_items: list[tuple[str, str]] = []
@@ -1503,7 +1973,7 @@ class TuvApp:
                 if self.installing:
                     self.message = "Refresh waits until the current install finishes"
                     return
-                self.ensure_uv(context, lambda: self.start_refresh(context, "Refreshing packages"))
+                self.ensure_uv_provider(context, lambda: self.start_refresh(context, "Refreshing packages"))
 
     def handle_version_overlay_key(self, key: str) -> None:
         if key in {"esc", "q", "f4"}:
@@ -1650,8 +2120,8 @@ class TuvApp:
             self.message = f"{row.display_name} is already at {row.installed_version}"
             row.status = "current"
             return
-        if not context.uv_available:
-            self.ensure_uv(context, lambda: self.request_install())
+        if refresh_context_uv_provider(context) is None:
+            self.ensure_uv_provider(context, lambda: self.request_install())
             return
         if context.type == "interpreter" and not context.confirmed_for_mutation:
             self.prompt = Prompt(
@@ -1692,15 +2162,16 @@ class TuvApp:
         package_display_name = row.display_name
         target_version = row.target_version
         package_spec = f"{package_display_name}=={target_version}"
-        command = [
-            str(context.python_path),
-            "-m",
-            "uv",
-            "pip",
-            "install",
-            "--python",
-            context.uv_target,
-        ]
+        try:
+            command = uv_command(context, ["pip", "install", "--python", context.uv_target])
+        except Exception as exc:
+            self.installing = False
+            self.active_install_context_id = None
+            row.status = "failed"
+            row.last_error = "uv provider unavailable"
+            row.last_error_detail = str(exc)
+            self.message = "uv provider unavailable"
+            return
         if context.type == "interpreter":
             command.append("--system")
         command.append(package_spec)
@@ -1864,8 +2335,8 @@ class TuvApp:
         for idx in range(start, start + items_visible):
             if idx < len(self.contexts):
                 marker = ">" if idx == self.context_overlay_index else " "
-                uv = "uv" if self.contexts[idx].uv_available else "no uv"
-                label = f"{marker} {self.contexts[idx].label} [{uv}]"
+                status = provider_label(self.contexts[idx].resolved_uv_provider)
+                label = f"{marker} {self.contexts[idx].label} [{status}]"
             else:
                 label = ""
             content = self.box_line(label, overlay_w)
@@ -2053,6 +2524,15 @@ def strip_ansi(text: str) -> str:
 
 
 def main() -> int:
+    if "--prepare-runner" in sys.argv:
+        mode = "default"
+        if "--launcher-mode" in sys.argv:
+            try:
+                mode = sys.argv[sys.argv.index("--launcher-mode") + 1]
+            except IndexError:
+                print("--launcher-mode requires a value", file=sys.stderr)
+                return 1
+        return print_prepare_runner(mode)
     if "--version" in sys.argv:
         print("tuv 0.1.0")
         return 0
