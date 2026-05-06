@@ -31,6 +31,13 @@ hash_file() {
   fi
 }
 
+fail_bootstrap() {
+  echo "Tuv runner bootstrap failed: $1" >&2
+  echo "Runner Python: ${TUV_RUNNER_PYTHON:-unknown}" >&2
+  echo "Runner venv: ${TUV_RUNNER_VENV:-unknown}" >&2
+  exit 1
+}
+
 find_bootstrap_python() {
   tmp="${TMPDIR:-/tmp}/tuv-bootstrap-python-$$.txt"
   : > "$tmp"
@@ -83,7 +90,10 @@ if [ -z "$BOOTSTRAP_PYTHON" ]; then
 fi
 
 export TUV_HOME
-PREP_OUTPUT=$("$BOOTSTRAP_PYTHON" "$APP" --prepare-runner --launcher-mode "$LAUNCHER_MODE")
+if ! PREP_OUTPUT=$("$BOOTSTRAP_PYTHON" "$APP" --prepare-runner --launcher-mode "$LAUNCHER_MODE" 2>&1); then
+  echo "$PREP_OUTPUT" >&2
+  exit 1
+fi
 eval "$(
   printf '%s\n' "$PREP_OUTPUT" | while IFS='=' read -r key value; do
     case "$key" in
@@ -100,11 +110,19 @@ if [ -z "${TUV_RUNNER_VENV:-}" ] || [ -z "${TUV_RUNNER_PYTHON:-}" ]; then
 fi
 
 if ! "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1; then
-  "$TUV_RUNNER_PYTHON" -m ensurepip --upgrade
+  "$TUV_RUNNER_PYTHON" -m ensurepip --upgrade || fail_bootstrap "runner pip is unavailable and ensurepip could not restore it"
+fi
+
+if ! "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1; then
+  fail_bootstrap "runner pip is unavailable after ensurepip"
 fi
 
 if ! "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1; then
-  "$TUV_RUNNER_PYTHON" -m pip install uv
+  "$TUV_RUNNER_PYTHON" -m pip install uv || fail_bootstrap "runner uv is unavailable and could not be installed; network or package index access may be unavailable"
+fi
+
+if ! "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1; then
+  fail_bootstrap "runner uv is unavailable after installation"
 fi
 
 REQ_HASH=$(hash_file "$REQ")
@@ -115,12 +133,12 @@ if [ -f "$STATE" ]; then
 fi
 
 if [ "$REQ_HASH" != "$STATE_HASH" ]; then
-  "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ"
+  "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
   printf '%s' "$REQ_HASH" > "$STATE"
 fi
 
 if ! "$TUV_RUNNER_PYTHON" -c 'import packaging' >/dev/null 2>&1; then
-  "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ"
+  "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
   printf '%s' "$REQ_HASH" > "$STATE"
 fi
 

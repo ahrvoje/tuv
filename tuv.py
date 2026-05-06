@@ -20,14 +20,30 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable
 
 try:
-    from packaging.utils import canonicalize_name
+    from packaging.markers import default_environment
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import (
+        InvalidSdistFilename,
+        InvalidWheelFilename,
+        canonicalize_name,
+        parse_sdist_filename,
+        parse_wheel_filename,
+    )
     from packaging.version import InvalidVersion, Version
 except Exception:  # pragma: no cover - runner requirements should provide packaging.
     canonicalize_name = lambda value: re.sub(r"[-_.]+", "-", value).lower()  # type: ignore
+    Requirement = None  # type: ignore
+    InvalidRequirement = Exception  # type: ignore
+    InvalidSdistFilename = Exception  # type: ignore
+    InvalidWheelFilename = Exception  # type: ignore
+    parse_sdist_filename = None  # type: ignore
+    parse_wheel_filename = None  # type: ignore
+    default_environment = None  # type: ignore
     Version = None  # type: ignore
     InvalidVersion = Exception  # type: ignore
 
@@ -105,13 +121,13 @@ class PythonContext:
 
     @property
     def uv_target(self) -> str:
-        if self.type in {"tuv", "active", "venv"} and self.root_path is not None:
+        if self.type in {"tuv", "venv"} and self.root_path is not None:
             return str(self.root_path)
         return str(self.python_path)
 
     @property
     def is_virtual(self) -> bool:
-        return self.type in {"tuv", "active", "venv"}
+        return self.type in {"tuv", "venv"}
 
     @property
     def uv_manageable(self) -> bool:
@@ -127,12 +143,16 @@ class PackageRow:
     target_version: str
     candidate_versions: list[str]
     status: str
-    versions_loaded: bool = False
+    metadata_trusted: bool = False
+    versions_resolved: bool = False
     dependency_packages: list[str] = field(default_factory=list)
     usage_packages: list[str] = field(default_factory=list)
+    description: str | None = None
     updated_in_session: bool = False
     last_error: str | None = None
     last_error_detail: str | None = None
+    last_install_result: "InstallResult | None" = None
+    operational_error: bool = False
 
     @property
     def is_outdated(self) -> bool:
@@ -150,10 +170,20 @@ class InstallResult:
     stderr: str
     elapsed: float
     before_versions: dict[str, str]
+    installed_version_at_attempt: str = ""
+    exit_code: int | None = None
+    stdout_tail: list[str] = field(default_factory=list)
+    stderr_tail: list[str] = field(default_factory=list)
+    failed_in_bulk_run_id: str | None = None
+    candidate_versions_at_attempt: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.returncode == 0
+
+    @property
+    def requested_version(self) -> str:
+        return self.target_version
 
 
 @dataclass
@@ -162,6 +192,12 @@ class Prompt:
     message: str
     on_yes: Callable[[], None]
     on_no: Callable[[], None] | None = None
+
+
+@dataclass
+class PackageMetadata:
+    description: str | None = None
+    dependencies: set[str] = field(default_factory=set)
 
 
 def version_key(value: str) -> tuple[int, object]:
@@ -240,6 +276,28 @@ def resolve_file_path(value: str | Path | None) -> Path | None:
         return path.resolve()
     except OSError:
         return None
+
+
+def possible_venv_root_for_python(executable: Path) -> Path | None:
+    parent = executable.parent
+    if parent.name.lower() in {"bin", "scripts"}:
+        root = parent.parent
+        if (root / "pyvenv.cfg").is_file():
+            return root.resolve()
+    if (parent / "pyvenv.cfg").is_file():
+        return parent.resolve()
+    return None
+
+
+def python_info_is_venv(info: PythonInfo) -> bool:
+    if info.prefix and info.base_prefix:
+        try:
+            if path_key(Path(info.prefix)) != path_key(Path(info.base_prefix)):
+                return True
+        except Exception:
+            if info.prefix != info.base_prefix:
+                return True
+    return possible_venv_root_for_python(info.executable) is not None
 
 
 def runner_python_path() -> Path:
@@ -573,6 +631,8 @@ def discover_python_infos() -> list[PythonInfo]:
         info = probe_python(candidate, source=source)
         if info is None:
             continue
+        if python_info_is_venv(info):
+            continue
         key = str(info.executable).lower() if IS_WINDOWS else str(info.executable)
         if key in seen:
             if source == "cwd":
@@ -585,12 +645,14 @@ def discover_python_infos() -> list[PythonInfo]:
     return infos
 
 
-def sorted_runner_infos(candidates: Iterable[Path], source: str) -> list[PythonInfo]:
+def sorted_runner_infos(candidates: Iterable[Path], source: str, allow_venv: bool = False) -> list[PythonInfo]:
     seen: set[str] = set()
     infos: list[PythonInfo] = []
     for candidate in candidates:
         info = probe_runner_python(candidate, source=source)
         if info is None:
+            continue
+        if not allow_venv and python_info_is_venv(info):
             continue
         key = path_key(info.executable)
         if key in seen:
@@ -604,7 +666,7 @@ def sorted_runner_infos(candidates: Iterable[Path], source: str) -> list[PythonI
 def select_runner_python(mode: str) -> PythonInfo:
     cwd = Path.cwd()
     if mode == "cwd":
-        infos = sorted_runner_infos(cwd_python_candidates(cwd, allow_venv=True), "cwd")
+        infos = sorted_runner_infos(cwd_python_candidates(cwd, allow_venv=True), "cwd", allow_venv=True)
         if not infos:
             raise RuntimeError(f"No usable current-working-directory Python was found in {cwd}")
         return infos[0]
@@ -677,6 +739,22 @@ def runner_python_ok(python_path: Path) -> bool:
     return proc.returncode == 0 and probe_python(python_path, timeout=5, source="tuv") is not None
 
 
+def runner_pip_functional_or_repairable(python_path: Path) -> bool:
+    if not python_path.is_file():
+        return False
+    try:
+        pip_check = run_command([str(python_path), "-m", "pip", "--version"], timeout=15)
+        if pip_check.returncode == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        ensure_check = run_command([str(python_path), "-c", "import ensurepip"], timeout=15)
+    except Exception:
+        return False
+    return ensure_check.returncode == 0
+
+
 def runner_venv_compatible(root: Path, key: str) -> bool:
     try:
         root = root.resolve()
@@ -692,7 +770,8 @@ def runner_venv_compatible(root: Path, key: str) -> bool:
     base_python = state.get("base_python", "")
     if not base_python or not Path(base_python).is_file():
         return False
-    return runner_python_ok(venv_python(root))
+    python_path = venv_python(root)
+    return runner_python_ok(python_path) and runner_pip_functional_or_repairable(python_path)
 
 
 def runner_venv_candidates() -> list[Path]:
@@ -862,7 +941,7 @@ def discover_contexts() -> list[PythonContext]:
 
     active = os.environ.get("VIRTUAL_ENV")
     if active:
-        add(venv_contexts, context_from_venv("active", Path(active), "active venv", "active"))
+        add(venv_contexts, context_from_venv("venv", Path(active), "active venv", "active"))
 
     cwd = Path.cwd()
     if is_venv(cwd):
@@ -888,78 +967,280 @@ def run_uv_json(context: PythonContext, args: list[str], timeout: float | None =
         raise RuntimeError(f"Could not parse uv JSON output: {exc}\n\n{proc.stdout}") from exc
 
 
-def dependency_map(context: PythonContext) -> dict[str, set[str]]:
+def installed_package_metadata(context: PythonContext) -> dict[str, PackageMetadata]:
     code = r"""
+import email.parser
 import importlib.metadata as metadata
 import json
+import os
+import pathlib
+import platform
 import re
+import sys
 
 def norm(value):
     return re.sub(r"[-_.]+", "-", value).lower()
 
-def req_name(value):
-    if not value:
-        return None
-    head = re.split(r"[<>=!~;\[\s(]", value, 1)[0].strip()
-    return norm(head) if head else None
-
 result = {}
-for dist in metadata.distributions():
-    name = dist.metadata.get("Name")
+
+def put(name, summary, requires):
     if not name:
+        return
+    key = norm(name)
+    current = result.setdefault(key, {"name": name, "summary": "", "requires": []})
+    if summary and not current["summary"]:
+        current["summary"] = str(summary)
+    current["requires"].extend(str(req) for req in (requires or []) if req)
+
+try:
+    for dist in metadata.distributions():
+        meta = dist.metadata
+        put(meta.get("Name"), meta.get("Summary"), list(dist.requires or meta.get_all("Requires-Dist") or []))
+except Exception:
+    pass
+
+for base in list(sys.path):
+    try:
+        root = pathlib.Path(base)
+        if not root.is_dir():
+            continue
+        for meta_path in root.glob("*.dist-info/METADATA"):
+            try:
+                msg = email.parser.Parser().parsestr(meta_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            put(msg.get("Name"), msg.get("Summary"), msg.get_all("Requires-Dist") or [])
+    except Exception:
         continue
-    deps = []
-    for req in dist.requires or []:
-        dep = req_name(req)
-        if dep:
-            deps.append(dep)
-    result[norm(name)] = sorted(set(deps))
-print(json.dumps(result))
+
+env = {
+    "implementation_name": sys.implementation.name,
+    "implementation_version": platform.python_version(),
+    "os_name": os.name,
+    "platform_machine": platform.machine(),
+    "platform_python_implementation": platform.python_implementation(),
+    "platform_release": platform.release(),
+    "platform_system": platform.system(),
+    "platform_version": platform.version(),
+    "python_full_version": platform.python_version(),
+    "python_version": f"{sys.version_info[0]}.{sys.version_info[1]}",
+    "sys_platform": sys.platform,
+    "extra": "",
+}
+
+for value in result.values():
+    value["requires"] = sorted(set(value["requires"]))
+
+print(json.dumps({"packages": result, "environment": env}))
 """
+    command = [str(context.python_path), "-c", code]
     try:
-        proc = run_command([str(context.python_path), "-c", code], timeout=30)
-    except Exception:
-        return {}
+        proc = run_command(command, timeout=30)
+    except Exception as exc:
+        raise RuntimeError(f"Could not collect package metadata: {exc}") from exc
     if proc.returncode != 0:
-        return {}
+        raise RuntimeError(command_detail(command, proc.returncode, proc.stdout, proc.stderr, 0))
     try:
-        raw = json.loads(proc.stdout.strip().splitlines()[-1])
-    except Exception:
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    result: dict[str, set[str]] = {}
-    for package_name, deps in raw.items():
-        if isinstance(package_name, str) and isinstance(deps, list):
-            result[canonicalize_name(package_name)] = {
-                canonicalize_name(str(dep)) for dep in deps if isinstance(dep, str)
-            }
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse package metadata JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Package metadata probe returned unexpected data")
+    raw_packages = payload.get("packages", {})
+    marker_env = payload.get("environment", {})
+    if not isinstance(raw_packages, dict):
+        raise RuntimeError("Package metadata probe returned unexpected package data")
+    if not isinstance(marker_env, dict):
+        marker_env = {}
+    result: dict[str, PackageMetadata] = {}
+    for package_name, item in raw_packages.items():
+        if not isinstance(package_name, str) or not isinstance(item, dict):
+            continue
+        summary = item.get("summary")
+        requires = item.get("requires", [])
+        deps = {
+            dep
+            for req in requires
+            if isinstance(req, str)
+            for dep in [dependency_name_from_requirement(req, marker_env)]
+            if dep
+        }
+        result[canonicalize_name(package_name)] = PackageMetadata(
+            description=short_description(summary),
+            dependencies=deps,
+        )
     return result
 
 
-def uninstall_safe_names(context: PythonContext) -> set[str]:
-    deps_by_package = dependency_map(context)
-    required: set[str] = set()
-    for deps in deps_by_package.values():
-        required.update(deps)
-    return set(deps_by_package) - required
+def dependency_name_from_requirement(requirement: str, marker_env: dict[str, object]) -> str | None:
+    if Requirement is not None:
+        try:
+            parsed = Requirement(requirement)
+            if parsed.marker is not None:
+                env = dict(default_environment() if default_environment is not None else {})
+                env.update({str(key): str(value) for key, value in marker_env.items()})
+                try:
+                    if not parsed.marker.evaluate(environment=env):
+                        return None
+                except Exception:
+                    pass
+            return canonicalize_name(parsed.name)
+        except InvalidRequirement:
+            pass
+    head = re.split(r"[<>=!~;\[\s(]", requirement, 1)[0].strip()
+    return canonicalize_name(head) if head else None
+
+
+def short_description(value: object) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    return text if len(text) <= 180 else text[:177].rstrip() + "..."
+
+
+class SimpleRepositoryLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        for name, value in attrs:
+            if name.lower() == "href" and value:
+                self.hrefs.append(value)
+
+
+def configured_index_urls() -> list[str]:
+    urls: list[str] = []
+
+    def add(value: str | None) -> None:
+        if not value:
+            return
+        for part in re.split(r"\s+", value.strip()):
+            if part and part not in urls:
+                urls.append(part)
+
+    primary = os.environ.get("UV_INDEX_URL") or os.environ.get("UV_DEFAULT_INDEX") or os.environ.get("PIP_INDEX_URL")
+    if primary:
+        add(primary)
+    else:
+        local = discover_local_index_url()
+        add(local or "https://pypi.org/simple/")
+    add(os.environ.get("UV_EXTRA_INDEX_URL") or os.environ.get("PIP_EXTRA_INDEX_URL"))
+    return urls
+
+
+def discover_local_index_url() -> str | None:
+    for directory in [Path.cwd(), *Path.cwd().parents]:
+        for filename in ("uv.toml", "pyproject.toml"):
+            path = directory / filename
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for key in ("default-index", "index-url", "index_url", "url"):
+                match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", text)
+                if match:
+                    return match.group(1)
+    return None
+
+
+def simple_project_url(index_url: str, package_name: str) -> str:
+    base = index_url.rstrip("/") + "/"
+    quoted = urllib.parse.quote(canonicalize_name(package_name), safe="")
+    return urllib.parse.urljoin(base, f"{quoted}/")
+
+
+def version_from_distribution_filename(filename: str, package_name: str) -> str | None:
+    base = Path(urllib.parse.unquote(urllib.parse.urlparse(filename).path)).name
+    if not base or base.endswith(".metadata"):
+        return None
+    normalized = canonicalize_name(package_name)
+    if parse_wheel_filename is not None:
+        try:
+            name, version, _build, _tags = parse_wheel_filename(base)
+            if canonicalize_name(str(name)) == normalized:
+                return str(version)
+        except (InvalidWheelFilename, ValueError):
+            pass
+    if parse_sdist_filename is not None:
+        try:
+            name, version = parse_sdist_filename(base)
+            if canonicalize_name(str(name)) == normalized:
+                return str(version)
+        except (InvalidSdistFilename, ValueError):
+            pass
+    return None
+
+
+def versions_from_simple_json(data: object, package_name: str) -> set[str]:
+    versions: set[str] = set()
+    if not isinstance(data, dict):
+        return versions
+    raw_versions = data.get("versions")
+    if isinstance(raw_versions, list):
+        versions.update(str(version) for version in raw_versions if isinstance(version, str))
+    files = data.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            filename = item.get("filename") or item.get("url")
+            if not isinstance(filename, str):
+                continue
+            version = version_from_distribution_filename(filename, package_name)
+            if version:
+                versions.add(version)
+    return versions
+
+
+def versions_from_simple_html(text: str, package_name: str) -> set[str]:
+    parser = SimpleRepositoryLinkParser()
+    parser.feed(text)
+    versions: set[str] = set()
+    for href in parser.hrefs:
+        version = version_from_distribution_filename(href, package_name)
+        if version:
+            versions.add(version)
+    return versions
 
 
 def fetch_available_versions(package_name: str, timeout: float = 12.0) -> list[str]:
-    quoted = urllib.parse.quote(canonicalize_name(package_name), safe="")
-    url = f"https://pypi.org/pypi/{quoted}/json"
-    request = urllib.request.Request(url, headers={"User-Agent": "tuv/0.1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    releases = data.get("releases", {})
-    if not isinstance(releases, dict):
-        return []
-    versions = [
-        str(version)
-        for version, files in releases.items()
-        if isinstance(version, str) and (not isinstance(files, list) or files)
-    ]
-    return sorted(set(versions), key=version_key)
+    versions: set[str] = set()
+    errors: list[str] = []
+    for index_url in configured_index_urls():
+        url = simple_project_url(index_url, package_name)
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.pypi.simple.v1+json, text/html;q=0.2",
+                "User-Agent": "tuv/0.1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content_type = response.headers.get("Content-Type", "")
+                body = response.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+        try:
+            if "json" in content_type or body.lstrip().startswith("{"):
+                versions.update(versions_from_simple_json(json.loads(body), package_name))
+            else:
+                versions.update(versions_from_simple_html(body, package_name))
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+    if versions:
+        return sorted(versions, key=version_key)
+    if errors:
+        raise RuntimeError("Version lookup failed: " + "; ".join(errors[-3:]))
+    return []
 
 
 def build_package_rows(context: PythonContext, updated_names: set[str]) -> tuple[list[PackageRow], str | None]:
@@ -985,7 +1266,7 @@ def build_package_rows(context: PythonContext, updated_names: set[str]) -> tuple
                 installed_version=installed,
                 target_version=installed,
                 candidate_versions=[installed],
-                status="current",
+                status="loading",
                 updated_in_session=normalized in updated_names,
             )
         )
@@ -1023,9 +1304,16 @@ def load_outdated_targets(context: PythonContext) -> tuple[dict[str, str], str |
 def load_dependency_info(
     context: PythonContext,
     display_by_name: dict[str, str],
-) -> tuple[set[str], dict[str, list[str]], dict[str, list[str]]]:
+) -> tuple[bool, set[str], dict[str, list[str]], dict[str, list[str]], dict[str, str | None]]:
     installed_names = set(display_by_name)
-    deps_by_package = dependency_map(context)
+    metadata_by_package = installed_package_metadata(context)
+    if installed_names and not installed_names.issubset(set(metadata_by_package)):
+        missing = sorted(installed_names - set(metadata_by_package))
+        raise RuntimeError(
+            "Package metadata did not match the displayed package list; "
+            f"missing metadata for {', '.join(missing[:8])}"
+        )
+    deps_by_package = {name: meta.dependencies for name, meta in metadata_by_package.items()}
     installed_deps_by_package = {
         package_name: {dep for dep in deps if dep in installed_names}
         for package_name, deps in deps_by_package.items()
@@ -1046,12 +1334,20 @@ def load_dependency_info(
         name: [display_by_name.get(user, user) for user in sorted(users)]
         for name, users in usage_by_package.items()
     }
-    return safe_names, dependency_packages, usage_packages
+    descriptions = {
+        name: metadata_by_package.get(name, PackageMetadata()).description
+        for name in installed_names
+    }
+    return True, safe_names, dependency_packages, usage_packages, descriptions
 
 
 def last_lines(text: str, count: int = 8) -> str:
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[-count:]) if lines else ""
+
+
+def tail_lines(text: str, count: int = 12) -> list[str]:
+    return [line.rstrip() for line in text.splitlines() if line.strip()][-count:]
 
 
 def command_detail(
@@ -1258,7 +1554,9 @@ class TuvApp:
         self.refresh_context_id: str | None = None
         self.refresh_generation = 0
         self.outdated_loading = False
+        self.target_resolution_loading = False
         self.dependency_loading = False
+        self.pending_after_refresh_action = False
         self.event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.updated_by_context: dict[str, set[str]] = {}
         self.installing = False
@@ -1268,9 +1566,12 @@ class TuvApp:
         self.bulk_queue: list[tuple[str, str]] = []
         self.bulk_processed: set[str] = set()
         self.bulk_failed_results: dict[str, InstallResult] = {}
+        self.bulk_run_id: str | None = None
+        self.bulk_run_counter = 0
         self.prompt: Prompt | None = None
         self.info_open = False
         self.info_scroll = 0
+        self.mutation_blocked_reason: str | None = None
         self.spinner_index = 0
         self.should_quit = False
         self.last_render = ""
@@ -1345,7 +1646,7 @@ class TuvApp:
 
     def default_context_index(self) -> int:
         for index, context in enumerate(self.contexts):
-            if context.type == "active":
+            if context.type == "venv" and context.source == "active":
                 return index
         for index, context in enumerate(self.contexts):
             if context.type == "venv" and context.root_path and context.root_path.name == ".venv":
@@ -1378,15 +1679,20 @@ class TuvApp:
         self.bulk_queue = []
         self.bulk_processed = set()
         self.bulk_failed_results = {}
+        self.bulk_run_id = None
         self.outdated_loading = False
+        self.target_resolution_loading = False
         self.dependency_loading = False
+        self.pending_after_refresh_action = False
         self.info_open = False
         self.info_scroll = 0
+        self.mutation_blocked_reason = None
         self.message = f"Loading {context.label}"
         self.ensure_uv_provider(context, lambda: self.start_refresh(context, "Loading packages"))
 
     def ensure_uv_provider(self, context: PythonContext, on_ready: Callable[[], None]) -> None:
         if refresh_context_uv_provider(context) is not None:
+            self.mutation_blocked_reason = None
             on_ready()
             return
         self.bootstrap_tuv_runner_uv(context, on_ready)
@@ -1407,11 +1713,34 @@ class TuvApp:
                         detail = command_detail(ensurepip, ensure.returncode, ensure.stdout, ensure.stderr, 0)
                         self.event_queue.put(("runner_uv_done", (context.id, 1, detail, on_ready)))
                         return
+                    pip_recheck = run_command([str(runner), "-m", "pip", "--version"], timeout=20)
+                    if pip_recheck.returncode != 0:
+                        detail = command_detail(
+                            [str(runner), "-m", "pip", "--version"],
+                            pip_recheck.returncode,
+                            pip_recheck.stdout,
+                            pip_recheck.stderr,
+                            0,
+                        )
+                        self.event_queue.put(("runner_uv_done", (context.id, 1, detail, on_ready)))
+                        return
                 install = [str(runner), "-m", "pip", "install", "uv"]
                 start = time.time()
                 proc = run_command(install, timeout=300)
                 elapsed = time.time() - start
                 detail = command_detail(install, proc.returncode, proc.stdout, proc.stderr, elapsed)
+                if proc.returncode == 0:
+                    uv_check = run_command([str(runner), "-m", "uv", "--version"], timeout=20)
+                    if uv_check.returncode != 0:
+                        detail = command_detail(
+                            [str(runner), "-m", "uv", "--version"],
+                            uv_check.returncode,
+                            uv_check.stdout,
+                            uv_check.stderr,
+                            0,
+                        )
+                        self.event_queue.put(("runner_uv_done", (context.id, 1, detail, on_ready)))
+                        return
                 self.event_queue.put(("runner_uv_done", (context.id, proc.returncode, detail, on_ready)))
             except Exception as exc:
                 self.event_queue.put(("runner_uv_done", (context.id, 1, str(exc), on_ready)))
@@ -1429,7 +1758,9 @@ class TuvApp:
         self.refresh_generation += 1
         generation = self.refresh_generation
         self.outdated_loading = False
+        self.target_resolution_loading = False
         self.dependency_loading = False
+        self.pending_after_refresh_action = False
         self.message = message
         updated_names = set(self.updated_by_context.get(context.id, set()))
 
@@ -1495,6 +1826,9 @@ class TuvApp:
             elif event == "versions_done":
                 row_name, versions, error = payload  # type: ignore[misc]
                 self.on_versions_done(row_name, versions, error)
+            elif event == "target_versions_done":
+                context_id, generation, results = payload  # type: ignore[misc]
+                self.on_target_versions_done(context_id, generation, results)
 
     def on_runner_uv_done(
         self,
@@ -1510,14 +1844,16 @@ class TuvApp:
             refresh_context_uv_provider(candidate)
         if returncode == 0 and refresh_context_uv_provider(context) is not None:
             self.message = "uv installed into Tuv runner venv"
+            self.mutation_blocked_reason = None
             on_ready()
             return
         self.message = "Tuv runner uv installation failed"
+        self.mutation_blocked_reason = self.message
         self.info_open = True
         self.rows = [
             PackageRow(
-                name="uv",
-                display_name="uv bootstrap",
+                name="__tuv_runner_uv_repair__",
+                display_name="Tuv runner uv repair failed",
                 uninstall_safe=False,
                 installed_version="-",
                 target_version="-",
@@ -1525,6 +1861,8 @@ class TuvApp:
                 status="failed",
                 last_error="Tuv runner uv installation failed",
                 last_error_detail=detail,
+                description="Tuv operational error: runner uv repair failed.",
+                operational_error=True,
             )
         ]
 
@@ -1555,6 +1893,7 @@ class TuvApp:
         if install_result is not None:
             self.installing = False
             self.active_install_context_id = None
+            self.pending_after_refresh_action = True
             if install_result.ok:
                 self.message = f"Installed {install_result.package_name}=={install_result.target_version}"
             else:
@@ -1565,16 +1904,12 @@ class TuvApp:
         else:
             self.message = f"Loaded {len(self.rows)} packages"
 
-        if install_result is not None:
-            if self.bulk_active:
-                self.continue_bulk_update()
-            else:
-                self.maybe_start_waiting_install()
-
         context = self.context
         if context is not None and context.id == context_id and not self.installing:
             self.start_dependency_refresh(context, generation)
             self.start_outdated_refresh(context, generation)
+        else:
+            self.finish_full_refresh()
 
     def on_refresh_failed(
         self,
@@ -1608,28 +1943,122 @@ class TuvApp:
         if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
             return
         self.outdated_loading = False
+        resolution_items: list[tuple[str, str, str]] = []
         for row in self.rows:
             latest = targets.get(row.name)
-            if not latest:
+            if row.status == "failed" and row.last_install_result is not None:
                 continue
-            if latest not in row.candidate_versions:
-                row.candidate_versions = sorted(set(row.candidate_versions + [latest]), key=version_key)
-            if (
-                row.target_version == row.installed_version
-                and row.status not in {"failed", "installing", "wait", "loading"}
-            ):
-                row.target_version = latest
-                row.status = "ready" if latest != row.installed_version else "current"
+            if not latest:
+                if row.status not in {"failed", "installing", "wait"}:
+                    row.target_version = row.installed_version
+                    row.status = "current"
+                continue
+            row.target_version = latest
+            row.versions_resolved = False
+            if row.status not in {"failed", "installing", "wait"}:
+                row.status = "loading"
+            if latest != row.installed_version:
+                resolution_items.append((row.name, row.display_name, latest))
+            elif row.status not in {"failed", "installing", "wait"}:
+                row.status = "current"
+        if resolution_items:
+            self.start_target_version_resolution(context_id, generation, resolution_items)
+        else:
+            self.target_resolution_loading = False
+            self.finish_full_refresh()
         if warning:
             self.message = warning
+        elif resolution_items:
+            self.message = f"Resolving target versions for {len(resolution_items)} package(s)"
         elif targets:
             self.message = "Latest target versions loaded"
+
+    def start_target_version_resolution(
+        self,
+        context_id: str,
+        generation: int,
+        items: list[tuple[str, str, str]],
+    ) -> None:
+        self.target_resolution_loading = True
+
+        def worker() -> None:
+            results: dict[str, tuple[list[str], str | None]] = {}
+            for normalized, display_name, target in items:
+                try:
+                    versions = fetch_available_versions(display_name)
+                    if target not in versions:
+                        results[normalized] = (
+                            versions,
+                            f"Resolved versions for {display_name} did not include target {target}",
+                        )
+                    else:
+                        results[normalized] = (versions, None)
+                except Exception as exc:
+                    results[normalized] = ([], str(exc))
+            self.event_queue.put(("target_versions_done", (context_id, generation, results)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_target_versions_done(
+        self,
+        context_id: str,
+        generation: int,
+        results: dict[str, tuple[list[str], str | None]],
+    ) -> None:
+        if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
+            return
+        self.target_resolution_loading = False
+        failed = 0
+        resolved = 0
+        for row in self.rows:
+            result = results.get(row.name)
+            if result is None:
+                continue
+            versions, error = result
+            if versions and error is None and row.target_version in versions:
+                row.candidate_versions = sorted(set(versions), key=version_key)
+                row.versions_resolved = True
+                row.last_error = None
+                row.last_error_detail = None
+                if row.status not in {"failed", "installing", "wait"}:
+                    row.status = "ready" if row.target_version != row.installed_version else "current"
+                resolved += 1
+            else:
+                failed += 1
+                row.versions_resolved = False
+                if versions:
+                    row.candidate_versions = sorted(set(versions), key=version_key)
+                row.status = "failed"
+                row.last_error = "Version lookup failed"
+                row.last_error_detail = error or f"No installable versions found for {row.display_name}"
+        if failed:
+            self.message = f"Version resolution failed for {failed} package(s)"
+        elif resolved:
+            self.message = f"Resolved target versions for {resolved} package(s)"
+        self.finish_full_refresh()
+
+    def finish_full_refresh(self) -> None:
+        if self.refreshing or self.outdated_loading or self.target_resolution_loading:
+            return
+        if not self.pending_after_refresh_action:
+            return
+        self.pending_after_refresh_action = False
+        if self.bulk_active:
+            self.continue_bulk_update()
+        else:
+            self.maybe_start_waiting_install()
 
     def on_dependency_done(
         self,
         context_id: str,
         generation: int,
-        dependency_payload: tuple[set[str], dict[str, list[str]], dict[str, list[str]]] | None,
+        dependency_payload: tuple[
+            bool,
+            set[str],
+            dict[str, list[str]],
+            dict[str, list[str]],
+            dict[str, str | None],
+        ] | None,
         error: str | None,
     ) -> None:
         if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
@@ -1639,11 +2068,15 @@ class TuvApp:
             if error:
                 self.message = f"Dependency data unavailable: {last_lines(error, 2)}"
             return
-        safe_names, dependency_packages, usage_packages = dependency_payload
+        metadata_trusted, safe_names, dependency_packages, usage_packages, descriptions = dependency_payload
+        if not metadata_trusted:
+            return
         for row in self.rows:
+            row.metadata_trusted = True
             row.uninstall_safe = row.name in safe_names
             row.dependency_packages = dependency_packages.get(row.name, [])
             row.usage_packages = usage_packages.get(row.name, [])
+            row.description = descriptions.get(row.name)
 
     def restore_bulk_failed_rows(self) -> None:
         if not self.bulk_failed_results:
@@ -1665,6 +2098,7 @@ class TuvApp:
 
     def mark_failed_row(self, result: InstallResult) -> None:
         if self.bulk_active:
+            result.failed_in_bulk_run_id = self.bulk_run_id
             self.bulk_failed_results[result.package_name] = result
             self.bulk_processed.add(result.package_name)
         self.apply_failed_result_to_row(result)
@@ -1681,12 +2115,15 @@ class TuvApp:
         row = self.find_row(result.package_name)
         if row is None:
             return
-        if result.target_version not in row.candidate_versions:
-            row.candidate_versions = sorted(set(row.candidate_versions + [result.target_version]), key=version_key)
+        if result.candidate_versions_at_attempt:
+            row.candidate_versions = sorted(set(result.candidate_versions_at_attempt), key=version_key)
         row.target_version = result.target_version
+        row.versions_resolved = result.target_version in row.candidate_versions
         row.status = "failed"
-        row.last_error = f"Install failed with exit code {result.returncode}"
+        exit_text = str(result.exit_code) if result.exit_code is not None else "process did not start"
+        row.last_error = f"Install failed with exit code {exit_text}"
         row.last_error_detail = detail
+        row.last_install_result = result
 
     def on_install_done(self, result: InstallResult) -> None:
         context = self.find_context(result.context_id)
@@ -1711,14 +2148,21 @@ class TuvApp:
             row.status = "current"
             self.message = f"Waiting package already current: {row.display_name}"
             return
-        if target_version not in row.candidate_versions:
-            row.candidate_versions = sorted(set(row.candidate_versions + [target_version]), key=version_key)
+        if not row.versions_resolved or target_version not in row.candidate_versions:
+            self.message = f"Waiting package no longer has resolved target: {row.display_name}"
+            return
         row.target_version = target_version
         self.begin_install(row)
 
     def start_bulk_update(self) -> None:
-        if self.installing or self.refreshing:
+        if self.mutation_blocked_reason:
+            self.message = self.mutation_blocked_reason
+            return
+        if self.installing:
             self.message = "Update all waits until the current activity finishes"
+            return
+        if self.version_resolution_busy():
+            self.message = "Update all waits for version resolution"
             return
         context = self.context
         if context is None:
@@ -1732,7 +2176,7 @@ class TuvApp:
             if row.name in seen:
                 continue
             seen.add(row.name)
-            if row.status == "ready" and not row.updated_in_session:
+            if row.status == "ready" and self.row_target_installable(row):
                 queue_items.append((row.name, row.target_version))
         if not queue_items:
             self.message = "No ready packages to update"
@@ -1767,6 +2211,8 @@ class TuvApp:
         ):
             context.confirmed_for_mutation = True
         self.bulk_active = True
+        self.bulk_run_counter += 1
+        self.bulk_run_id = f"bulk-{self.bulk_run_counter}"
         self.bulk_queue = list(queue_items)
         self.bulk_processed = set()
         self.bulk_failed_results = {}
@@ -1800,11 +2246,14 @@ class TuvApp:
                     row.status = "skipped"
                 continue
             if row.installed_version == target_version or row.status in {"failed", "installing"}:
-                row.status = "skipped" if row.status not in {"current", "failed"} else row.status
+                if row.status != "failed":
+                    row.status = "skipped"
                 self.bulk_processed.add(normalized)
                 continue
-            if target_version not in row.candidate_versions:
-                row.candidate_versions = sorted(set(row.candidate_versions + [target_version]), key=version_key)
+            if not row.versions_resolved or target_version not in row.candidate_versions:
+                row.status = "skipped"
+                self.bulk_processed.add(normalized)
+                continue
             row.target_version = target_version
             self.bulk_processed.add(normalized)
             self.mark_bulk_pending_waits()
@@ -1813,6 +2262,7 @@ class TuvApp:
         self.bulk_active = False
         self.bulk_processed = set()
         self.bulk_failed_results = {}
+        self.bulk_run_id = None
         self.message = "Update all complete"
         self.maybe_start_waiting_install()
 
@@ -1832,7 +2282,7 @@ class TuvApp:
         self.ensure_version_overlay_visible()
 
     def start_version_lookup(self, row: PackageRow, pending_direction: int | None = None) -> bool:
-        if row.versions_loaded:
+        if row.versions_resolved:
             return False
         if self.version_loading:
             if self.version_overlay_row == row.name and pending_direction is not None:
@@ -1845,8 +2295,10 @@ class TuvApp:
         self.version_error = None
         self.version_loading = True
         self.pending_version_direction = pending_direction
-        if row.status not in {"installing", "wait", "failed"}:
+        if row.status not in {"installing", "wait"} and not (row.status == "failed" and row.last_install_result is not None):
             row.status = "loading"
+            row.last_error = None
+            row.last_error_detail = None
         self.message = f"Loading versions for {row.display_name}"
 
         def worker(package_name: str) -> None:
@@ -1860,6 +2312,9 @@ class TuvApp:
         return True
 
     def apply_version_direction(self, row: PackageRow, direction: int) -> None:
+        if not row.versions_resolved:
+            self.message = f"Version lookup is not ready for {row.display_name}"
+            return
         if not row.candidate_versions:
             return
         candidates = sorted(set(row.candidate_versions + [row.target_version]), key=version_key)
@@ -1895,16 +2350,23 @@ class TuvApp:
         pending_direction = self.pending_version_direction if self.version_overlay_row == row.name else None
         self.pending_version_direction = None
         if versions:
-            row.candidate_versions = sorted(set(versions + row.candidate_versions), key=version_key)
-            row.versions_loaded = True
+            row.candidate_versions = sorted(set(versions), key=version_key)
+            row.versions_resolved = True
+            row.last_error = None
+            row.last_error_detail = None
             self.refresh_version_options(row)
             self.version_error = None
             self.message = f"Loaded {len(self.version_options)} versions for {row.display_name}"
         else:
+            row.versions_resolved = False
             self.refresh_version_options(row)
             self.version_error = f"Version lookup failed: {last_lines(error or 'no versions found', 2)}"
             self.message = self.version_error
-        if row.status == "loading":
+            if row.status == "loading":
+                row.status = "failed"
+                row.last_error = "Version lookup failed"
+                row.last_error_detail = error or "No installable versions found"
+        if row.status == "loading" and versions:
             row.status = "ready" if row.target_version != row.installed_version else "current"
         if pending_direction is not None and versions:
             self.apply_version_direction(row, pending_direction)
@@ -2007,9 +2469,13 @@ class TuvApp:
             if row is None:
                 self.version_overlay = False
                 return
+            if self.version_loading or self.version_error or not row.versions_resolved:
+                self.message = f"Version lookup is not ready for {row.display_name}"
+                return
             selected = self.version_options[self.version_overlay_index]
-            if selected not in row.candidate_versions:
-                row.candidate_versions = sorted(set(row.candidate_versions + [selected]), key=version_key)
+            if selected not in row.candidate_versions and selected != row.installed_version:
+                self.message = f"Version data unavailable for {row.display_name}"
+                return
             row.target_version = selected
             if row.status not in {"installing", "wait", "failed"}:
                 row.status = "ready" if row.target_version != row.installed_version else "current"
@@ -2097,7 +2563,7 @@ class TuvApp:
         row = self.focused_row()
         if row is None:
             return
-        if not row.versions_loaded:
+        if not row.versions_resolved:
             self.start_version_lookup(row, pending_direction=direction)
             return
         self.apply_version_direction(row, direction)
@@ -2108,10 +2574,35 @@ class TuvApp:
         self.focus_index = max(0, min(self.focus_index, len(self.rows) - 1))
         return self.rows[self.focus_index]
 
+    def version_resolution_busy(self) -> bool:
+        return self.refreshing or self.outdated_loading or self.target_resolution_loading or self.version_loading
+
+    def row_target_installable(self, row: PackageRow) -> bool:
+        return (
+            row.target_version != row.installed_version
+            and row.versions_resolved
+            and row.target_version in row.candidate_versions
+            and row.status not in {"loading", "installing"}
+        )
+
+    def block_unresolved_action(self, row: PackageRow | None = None) -> bool:
+        if self.version_resolution_busy():
+            self.message = "Version resolution is still in progress"
+            return True
+        if row is not None and row.target_version != row.installed_version and not self.row_target_installable(row):
+            self.message = f"Version data unavailable for {row.display_name}"
+            return True
+        return False
+
     def request_install(self) -> None:
         context = self.context
         row = self.focused_row()
         if context is None or row is None:
+            return
+        if self.mutation_blocked_reason:
+            self.message = self.mutation_blocked_reason
+            return
+        if self.block_unresolved_action(row):
             return
         if self.installing:
             self.mark_wait(row, context)
@@ -2140,10 +2631,19 @@ class TuvApp:
 
     def mark_wait(self, row: PackageRow, context: PythonContext) -> None:
         if self.wait_request:
-            _, old_name, _ = self.wait_request
+            old_context_id, old_name, old_target = self.wait_request
+            if old_context_id == context.id and old_name == row.name and old_target == row.target_version:
+                row.status = "wait"
+                self.message = f"Queued after current install: {row.display_name}"
+                return
             old_row = self.find_row(old_name)
             if old_row and old_row.status == "wait":
-                old_row.status = "ready" if old_row.target_version != old_row.installed_version else "current"
+                if old_row.target_version == old_row.installed_version:
+                    old_row.status = "current"
+                elif old_row.versions_resolved and old_row.target_version in old_row.candidate_versions:
+                    old_row.status = "ready"
+                else:
+                    old_row.status = "loading"
         row.status = "wait"
         self.wait_request = (context.id, row.name, row.target_version)
         self.message = f"Queued after current install: {row.display_name}"
@@ -2152,15 +2652,21 @@ class TuvApp:
         context = self.context
         if context is None:
             return
+        if not self.row_target_installable(row):
+            self.message = f"Version data unavailable for {row.display_name}"
+            return
         self.installing = True
         self.active_install_context_id = context.id
         row.status = "installing"
         row.last_error = None
         row.last_error_detail = None
+        row.last_install_result = None
         before_versions = {item.name: item.installed_version for item in self.rows}
         package_name = row.name
         package_display_name = row.display_name
         target_version = row.target_version
+        installed_version_at_attempt = row.installed_version
+        candidate_versions_at_attempt = list(row.candidate_versions)
         package_spec = f"{package_display_name}=={target_version}"
         try:
             command = uv_command(context, ["pip", "install", "--python", context.uv_target])
@@ -2192,9 +2698,15 @@ class TuvApp:
                     stderr=proc.stderr,
                     elapsed=elapsed,
                     before_versions=before_versions,
+                    installed_version_at_attempt=installed_version_at_attempt,
+                    exit_code=proc.returncode,
+                    stdout_tail=tail_lines(proc.stdout),
+                    stderr_tail=tail_lines(proc.stderr),
+                    candidate_versions_at_attempt=candidate_versions_at_attempt,
                 )
             except Exception as exc:
                 elapsed = time.time() - start
+                stderr = str(exc)
                 result = InstallResult(
                     context_id=context.id,
                     package_name=package_name,
@@ -2202,9 +2714,14 @@ class TuvApp:
                     command=command,
                     returncode=1,
                     stdout="",
-                    stderr=str(exc),
+                    stderr=stderr,
                     elapsed=elapsed,
                     before_versions=before_versions,
+                    installed_version_at_attempt=installed_version_at_attempt,
+                    exit_code=None,
+                    stdout_tail=[],
+                    stderr_tail=tail_lines(stderr),
+                    candidate_versions_at_attempt=candidate_versions_at_attempt,
                 )
             self.event_queue.put(("install_done", result))
 
@@ -2270,7 +2787,7 @@ class TuvApp:
     def render_row(self, width: int, index: int, row: PackageRow) -> str:
         name_w, installed_w, target_w, action_w = self.columns(width)
         action = self.display_status(row)
-        name = ("* " if row.uninstall_safe else "  ") + row.display_name
+        name = ("* " if row.metadata_trusted and row.uninstall_safe else "  ") + row.display_name
         text = (
             f"{truncate(name, name_w):<{name_w}}"
             f"{truncate(row.installed_version, installed_w):<{installed_w}}"
@@ -2329,9 +2846,9 @@ class TuvApp:
         overlay_h = min(height - 4, max(6, len(self.contexts) + 4))
         top = max(1, (height - overlay_h) // 2)
         left = max(1, (width - overlay_w) // 2)
-        items_visible = overlay_h - 3
+        items_visible = overlay_h - 2
         start = max(0, min(self.context_overlay_index, max(0, len(self.contexts) - items_visible)))
-        box = [self.box_border(overlay_w, "top"), self.box_line("Context selector", overlay_w)]
+        box = [self.box_border(overlay_w, "top", "Context selector")]
         for idx in range(start, start + items_visible):
             if idx < len(self.contexts):
                 marker = ">" if idx == self.context_overlay_index else " "
@@ -2353,10 +2870,10 @@ class TuvApp:
         overlay_h = min(height - 4, max(8, min(len(self.version_options) + 5, height - 4)))
         top = max(1, (height - overlay_h) // 2)
         left = max(1, (width - overlay_w) // 2)
-        items_visible = overlay_h - 4
+        items_visible = overlay_h - 3
         self.ensure_version_overlay_visible(items_visible)
         start = self.version_overlay_scroll
-        box = [self.box_border(overlay_w, "top"), self.box_line(title, overlay_w)]
+        box = [self.box_border(overlay_w, "top", title)]
         hint = "Enter install | Esc/q close"
         if self.version_loading:
             hint = "Loading versions... | Esc/q close"
@@ -2380,7 +2897,25 @@ class TuvApp:
         return paste_box(lines, box, top, left, width)
 
     def package_relation_lines(self, row: PackageRow) -> list[str]:
-        lines = ["", "Dependency packages:"]
+        if not row.metadata_trusted:
+            return [
+                "",
+                "Description:",
+                "  (metadata unavailable)",
+                "",
+                "Dependency packages:",
+                "  (metadata unavailable)",
+                "",
+                "Usage packages:",
+                "  (metadata unavailable)",
+            ]
+        lines = [
+            "",
+            "Description:",
+            f"  {row.description or '(empty)'}",
+            "",
+            "Dependency packages:",
+        ]
         if row.dependency_packages:
             lines.extend(f"  {name}" for name in row.dependency_packages)
         else:
@@ -2397,10 +2932,29 @@ class TuvApp:
         row = self.focused_row()
         if row is None:
             body = ["No package selected."]
+        elif row.operational_error:
+            body = [
+                "Tuv operational error",
+                "",
+                row.last_error or row.display_name,
+                "",
+                f"Runner: {runner_python_path()}",
+                "",
+                *(row.last_error_detail or "").splitlines(),
+            ]
         elif row.status == "failed" and row.last_error_detail:
+            result = row.last_install_result
+            exit_code = (
+                str(result.exit_code)
+                if result is not None and result.exit_code is not None
+                else "process did not start"
+            )
+            elapsed = f"{result.elapsed:.1f}s" if result is not None else "unknown"
             body = [
                 f"Package: {row.display_name}",
-                f"Version: {row.installed_version}",
+                f"Version: {result.installed_version_at_attempt if result else row.installed_version}",
+                f"Exit code: {exit_code}",
+                f"Elapsed: {elapsed}",
                 *self.package_relation_lines(row),
                 "",
                 row.last_error or "Install failed",
@@ -2438,10 +2992,10 @@ class TuvApp:
                 wrapped.append("")
             else:
                 wrapped.extend(textwrap.wrap(line, width=max(10, overlay_w - 4)) or [""])
-        overlay_h = min(height - 4, max(6, min(len(wrapped) + 4, height - 4)))
+        overlay_h = min(height - 4, max(6, min(len(wrapped) + 3, height - 4)))
         top = max(1, (height - overlay_h) // 2)
         left = max(1, (width - overlay_w) // 2)
-        visible = overlay_h - 3
+        visible = overlay_h - 2
         scroll = 0
         if scroll_attr is not None:
             scroll = max(0, int(getattr(self, scroll_attr, 0)))
@@ -2449,7 +3003,7 @@ class TuvApp:
             setattr(self, scroll_attr, scroll)
             if len(wrapped) > visible:
                 title = f"{title} ({scroll + 1}-{min(scroll + visible, len(wrapped))}/{len(wrapped)})"
-        box = [self.box_border(overlay_w, "top"), self.box_line(title, overlay_w)]
+        box = [self.box_border(overlay_w, "top", title)]
         for line in wrapped[scroll : scroll + visible]:
             box.append(self.box_line(line, overlay_w))
         while len(box) < overlay_h - 1:
@@ -2457,9 +3011,20 @@ class TuvApp:
         box.append(self.box_border(overlay_w, "bottom"))
         return paste_box(lines, box, top, left, width)
 
-    def box_border(self, width: int, kind: str = "top") -> str:
+    def box_border(self, width: int, kind: str = "top", title: str | None = None) -> str:
         if kind == "bottom":
             return "└" + "─" * (width - 2) + "┘"
+        if title:
+            inner = max(0, width - 2)
+            if inner <= 0:
+                return "┌┐"
+            max_title_width = max(0, inner - 3)
+            title_text = truncate(title, max_title_width)
+            label = f" {title_text} " if title_text else " "
+            if len(label) >= inner:
+                label = truncate(label, inner)
+            fill = "─" * max(0, inner - len(label))
+            return "┌" + label + fill + "┐"
         return "┌" + "─" * (width - 2) + "┐"
 
     def box_line(self, text: str, width: int) -> str:
@@ -2475,21 +3040,6 @@ def truncate(value: object, width: int) -> str:
     if width == 1:
         return text[:1]
     return text[: width - 1] + "~"
-
-
-def framed_join(left: str, right: str, width: int) -> str:
-    inner = width - 2
-    if len(left) + len(right) > inner:
-        left = truncate(left, inner - len(right))
-    gap = max(0, inner - len(left) - len(right))
-    return "│" + left + " " * gap + right + "│"
-
-
-def unframed_join(left: str, right: str, width: int) -> str:
-    if len(left) + len(right) > width:
-        left = truncate(left, max(0, width - len(right) - 1))
-    gap = max(1, width - len(left) - len(right))
-    return (left + " " * gap + right)[:width].ljust(width)
 
 
 def paste_box(lines: list[str], box: list[str], top: int, left: int, width: int) -> list[str]:

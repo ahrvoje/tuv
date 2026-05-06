@@ -1,7 +1,5 @@
 # Tuv Specification
 
-Status: Draft v0.2
-
 Tuv is an alternate-screen terminal UI Python package manager backed by `uv`. It gives users a fast, keyboard-driven way to inspect installed packages for a selected Python context, choose target versions, and run package installations without leaving the terminal.
 
 ## Goals
@@ -14,16 +12,17 @@ Tuv is an alternate-screen terminal UI Python package manager backed by `uv`. It
 - Let the user select a discovered Python interpreter, a current-working-directory Python distribution, a current-directory virtual environment, the active virtual environment, or the Tuv runner venv.
 - Show a tabular overview of all installed packages in the selected context.
 - Allow target version selection from the table and run installation for the focused package.
-- Start the UI immediately and keep it lightning responsive while package metadata and operations run asynchronously.
+- Treat perceived snappiness as a deliberate design choice: show the first useful TUI frame as soon as runner bootstrap permits, avoid blocking it on package metadata, and keep package metadata and operations asynchronous.
 - Be skilled at discovering the newest available Python interpreter on each supported platform.
 
-## Non-Goals for v0.1
+## Non-Goals
 
 - Replacing `uv` project management, lockfile management, or `pyproject.toml` editing.
 - Creating, deleting, or repairing user project virtual environments.
 - Supporting package search and first-time installation of packages that are not already installed.
 - Running concurrent package mutations.
 - Silently modifying a system Python installation without an explicit confirmation.
+- Overriding externally managed Python protections such as `--break-system-packages`.
 
 ## Deployment Artifacts
 
@@ -55,12 +54,14 @@ Launcher responsibilities:
 6. After selecting the runner Python, find a compatible Tuv runner venv under `TUV_HOME`; if none exists, create a new script-relative runner venv with a hash suffix such as `TUV_HOME/tuv-venv-1a3b8e4f`.
 7. Verify that the selected runner venv Python exists and can execute the standard JSON probe. If it is missing, removed, broken, or points at a removed base interpreter, mark that runner venv incompatible and select or create another compatible runner venv.
 8. Record the interpreter used to build the runner venv. If a different runner Python is later selected, use a compatible runner venv for that interpreter instead of mutating an incompatible runner venv in place.
-9. Ensure `pip` in the selected Tuv runner venv. If `<tuv-venv-python> -m pip --version` fails, run `<tuv-venv-python> -m ensurepip --upgrade`.
-10. Ensure `uv` in the selected Tuv runner venv. If `<tuv-venv-python> -m uv --version` fails, install it with `<tuv-venv-python> -m pip install uv`, after ensuring runner pip.
-11. Install `requirements.txt` into the selected runner venv using the runner venv Python.
-12. Detect whether a standalone system `uv` executable is available by running `uv --version`.
-13. Execute `TUV_HOME/tuv.py` with the selected runner venv Python.
-14. Forward remaining CLI arguments to `tuv.py`.
+9. Ensure the selected Tuv runner venv can be put into functional mode. Functional mode means runner Python works, `pip` works or can be restored with `ensurepip`, and `uv` works or can be installed through runner `pip`.
+10. Ensure `pip` in the selected Tuv runner venv. If `<tuv-venv-python> -m pip --version` fails, run `<tuv-venv-python> -m ensurepip --upgrade`, then check runner `pip` again.
+11. Ensure `uv` in the selected Tuv runner venv. If `<tuv-venv-python> -m uv --version` fails, install it with `<tuv-venv-python> -m pip install uv`, after ensuring runner pip.
+12. If runner `pip`, runner `uv`, and runner `ensurepip` are all unavailable or cannot make the runner venv functional, exit gracefully with an informative message instead of starting a broken TUI.
+13. Install `requirements.txt` into the selected runner venv using the runner venv Python.
+14. Detect whether a standalone system `uv` executable is available by running `uv --version`.
+15. Execute `TUV_HOME/tuv.py` with the selected runner venv Python.
+16. Forward remaining CLI arguments to `tuv.py`.
 
 The launcher should pass discovery anchors to `tuv.py` through environment variables:
 
@@ -73,7 +74,9 @@ The launcher should pass discovery anchors to `tuv.py` through environment varia
 
 The launcher must continue to discover the most recent usable platform Python interpreter for default launches and use it for the Tuv runner environment. This preserves predictable startup and venv management even when package operations later choose a more local uv provider for a selected context. The explicit dot argument overrides this default and intentionally uses the current-working-directory Python as the runner Python.
 
-The launcher must not require `pip` or `uv` in the base interpreter used to create the Tuv runner venv. Base Python only needs to be able to execute the probe and create or repair the Tuv runner venv. All Tuv-owned dependency bootstrapping after venv creation happens inside the Tuv runner venv.
+The launcher must not require `pip` or `uv` in the base interpreter used to create the Tuv runner venv. Base Python only needs to be able to execute the probe and create or repair the Tuv runner venv. All Tuv-owned dependency bootstrapping after venv creation happens inside the Tuv runner venv. However, the selected runner path must ultimately produce a functional runner venv; if the runner venv cannot obtain working `pip` through existing runner `pip` or runner `ensurepip`, and therefore cannot install or run runner-local `uv`, the launcher must report the problem clearly.
+
+When bootstrapping requires network access and dependencies cannot be installed because the network or package index is unavailable, Tuv must exit gracefully with a message that names the unavailable runner dependency and suggests retrying with network access or pre-populating the runner venv. It must not leave the terminal in alternate-screen mode for launcher-time failures.
 
 When a standalone system provider or Tuv runner venv provider is available, Tuv must not require `uv` or `pip` to be installed in any selected target context. This allows Tuv to inspect and manage Python distributions that contain a Python interpreter but lack both `uv` and `pip`.
 
@@ -88,8 +91,8 @@ Runner Python discovery sequence:
 3. Without the dot argument, add platform discovery candidates first:
    - Windows: Python Launcher output from `py -0p`, PEP 514 registry locations, `PATH` executables, and common install directories.
    - POSIX: common `PATH` names such as `python3.13`, `python3.12`, `python3`, and `python`, plus common install directories.
-4. Probe each platform candidate by executing it. A runner-usable interpreter must report its version and executable path, and must be able to import the standard-library `venv` module.
-5. Ignore platform candidates that cannot execute, cannot report a version, are unsupported, or cannot create or maintain the Tuv runner venv.
+4. Probe each platform candidate by executing it. A runner-usable interpreter must report its version and executable path, must not be a virtual environment interpreter, must be able to import the standard-library `venv` module, and must be capable of creating a runner venv that can be made functional.
+5. Ignore platform candidates that cannot execute, cannot report a version, are unsupported, are virtual environment interpreters, or cannot create or maintain the Tuv runner venv.
 6. Deduplicate usable platform candidates by resolved executable path.
 7. Sort usable platform candidates by semantic Python version, newest first.
 8. If at least one usable platform candidate remains, select the first candidate as `NEWEST_PYTHON`.
@@ -98,7 +101,7 @@ Runner Python discovery sequence:
    - Windows: `python.exe`, `python3.exe`, `Scripts\python.exe`, and `bin\python.exe`.
    - POSIX: `python`, `python3`, `bin/python`, and `bin/python3`.
 11. In explicit cwd-runner mode, a current working directory containing `pyvenv.cfg` may use its venv Python as the explicit cwd Python when that Python is runner-usable. In default mode, a current working directory containing `pyvenv.cfg` remains a virtual environment context and is not used as the runner fallback.
-12. Probe, filter, deduplicate, and sort current-working-directory candidates with the same rules used for platform candidates.
+12. Probe, filter, deduplicate, and sort current-working-directory candidates with the same rules used for platform candidates, except that explicit cwd-runner mode may intentionally accept a current-directory virtual environment interpreter when the current directory contains `pyvenv.cfg`.
 13. If no usable platform candidate exists but a usable current-working-directory fallback candidate exists, select the newest fallback candidate as `NEWEST_PYTHON`.
 14. If neither platform nor current-working-directory fallback discovery yields a usable interpreter, exit with a clear message that no usable Python interpreter was found.
 15. Use `NEWEST_PYTHON` only as the base interpreter for selecting, creating, or repairing a Tuv runner venv and for Tuv-owned venv management. `NEWEST_PYTHON` does not need `pip` or `uv`.
@@ -139,7 +142,9 @@ if runner_python_missing_or_broken "$RUNNER_PYTHON" || ! runner_state_is_compati
   write_runner_state "$RUNNER_STATE" "$NEWEST_PYTHON"
 fi
 "$RUNNER_PYTHON" -m pip --version >/dev/null 2>&1 || "$RUNNER_PYTHON" -m ensurepip --upgrade
+"$RUNNER_PYTHON" -m pip --version >/dev/null 2>&1 || fail_runner_bootstrap "runner pip is unavailable and ensurepip could not restore it"
 "$RUNNER_PYTHON" -m uv --version >/dev/null 2>&1 || "$RUNNER_PYTHON" -m pip install uv
+"$RUNNER_PYTHON" -m uv --version >/dev/null 2>&1 || fail_runner_bootstrap "runner uv is unavailable and could not be installed"
 "$RUNNER_PYTHON" -m pip install -r "$TUV_HOME/requirements.txt"
 if command -v uv >/dev/null 2>&1 && uv --version >/dev/null 2>&1; then
   export TUV_SYSTEM_UV_EXE="$(command -v uv)"
@@ -177,7 +182,9 @@ set "RUNNER_STATE=%RUNNER%\.tuv-runner-state"
 call :write_runner_state "%RUNNER_STATE%" "%NEWEST_PYTHON%"
 :runner_ready
 "%RUNNER_PYTHON%" -m pip --version >nul 2>nul || "%RUNNER_PYTHON%" -m ensurepip --upgrade
+"%RUNNER_PYTHON%" -m pip --version >nul 2>nul || goto runner_bootstrap_failed
 "%RUNNER_PYTHON%" -m uv --version >nul 2>nul || "%RUNNER_PYTHON%" -m pip install uv
+"%RUNNER_PYTHON%" -m uv --version >nul 2>nul || goto runner_bootstrap_failed
 "%RUNNER_PYTHON%" -m pip install -r "%TUV_HOME%\requirements.txt"
 for /f "delims=" %%I in ('where uv 2^>nul') do if not defined TUV_SYSTEM_UV_EXE set "TUV_SYSTEM_UV_EXE=%%I"
 if defined TUV_SYSTEM_UV_EXE "%TUV_SYSTEM_UV_EXE%" --version >nul 2>nul || set "TUV_SYSTEM_UV_EXE="
@@ -190,6 +197,8 @@ set "TUV_RUNNER_PYTHON=%RUNNER_PYTHON%"
 The launcher should avoid reinstalling requirements on every run. It should store a hash or timestamp marker for `requirements.txt` under the selected runner venv, at `<runner-venv>/.tuv-requirements-state`, and reinstall only when the file changes.
 
 Runner repair must be careful but automatic. A launcher may mark incompatible only a script-relative Tuv-owned runner directory whose name is `tuv-venv-<hash>` or the legacy `.tuv-venv`, after resolving the path and verifying it is directly inside `TUV_HOME`. It must not touch arbitrary virtual environments. A broken or stale runner venv is a Tuv-owned runtime artifact, not user project state.
+
+If runner bootstrap fails because `pip`, `ensurepip`, or `uv` cannot be made available, the launcher must print a concise diagnostic that includes the selected runner Python path, runner venv path, and the failing step. Network or index failures during runner dependency installation should be reported as bootstrap failures, not as TUI package-operation failures.
 
 ## Python and uv Discovery
 
@@ -225,6 +234,7 @@ Interpreter discovery for the TUI:
 ```
 
 - Ignore candidates that cannot execute, cannot report a version, or are unsupported.
+- For interpreter contexts, ignore candidates whose probe reports a virtual environment (`sys.prefix` differs from `sys.base_prefix`) or whose executable is inside a directory containing `pyvenv.cfg`; those candidates must be represented only as virtual environment contexts.
 - Deduplicate by resolved executable path.
 - Sort by semantic Python version, preferring higher version numbers.
 - Current-working-directory interpreters are deduplicated by executable path like all other candidates, but their context metadata should preserve that they were found from `cwd` so the selector can label them clearly.
@@ -233,11 +243,14 @@ uv provider bootstrap:
 
 - Probe uv providers in the defined hierarchy for each selected context.
 - Runner startup must ensure both `pip` and `uv` are available inside the Tuv runner venv before launching `tuv.py`.
+- Runner startup must verify the runner venv reached functional mode: runner Python executes, runner `pip` works, and runner `uv` works.
 - Never offer to install `uv` into a selected context virtual environment.
 - Never offer to install `uv` into a selected interpreter context.
 - If no usable provider can be resolved after startup, repair or re-bootstrap `uv` in the Tuv runner venv.
 - Install or repair Tuv runner venv `uv` with `<tuv-venv-python> -m pip install uv`.
-- If `pip` is unavailable in the Tuv runner venv, run `<tuv-venv-python> -m ensurepip --upgrade` before installing `uv`.
+- If `pip` is unavailable in the Tuv runner venv, run `<tuv-venv-python> -m ensurepip --upgrade` before installing `uv`, then verify `pip` again.
+- If runner `pip` is still unavailable and runner `ensurepip` cannot restore it, Tuv cannot ensure a compatible runner environment; exit gracefully with an informative bootstrap error.
+- If runner `pip` works but runner `uv` cannot be installed because the network or configured index is unavailable, exit gracefully with an informative bootstrap error and leave user project environments untouched.
 - If a target context lacks both `uv` and `pip`, still offer it when any resolved uv provider can run `uv pip ... --python <context>`.
 - Never install `uv` into a non-Tuv environment silently. Tuv-owned runner venv pip and uv bootstrap may be automatic because the selected hash-suffixed runner venv is a Tuv runtime artifact.
 
@@ -261,10 +274,11 @@ Required native terminal behavior:
 - Use `try`/`finally` so terminal state is restored after errors.
 - Use `os.get_terminal_size()` for responsive table sizing.
 - Redraw the screen after input, package refresh, installation status changes, spinner ticks, and resize events.
-- Decode common keyboard sequences for arrows, `PageUp`, `PageDown`, `Left`, `Right`, `Enter`, `F3`, `F4`, `F9`, refresh, and quit.
+- Decode common keyboard sequences for arrows, `PageUp`, `PageDown`, `Left`, `Right`, `Enter`, `F3`, `F4`, `F9`, `F10`, refresh, and quit.
 - Decode `F2` for updating all ready packages.
 - Decode `F4` for opening a package version selector overlay.
 - Decode `Esc` and `q` for closing every modal overlay or dialog.
+- Decode `F10` and main-screen `q` for quitting the application when no modal overlay or dialog is active.
 
 Input handling:
 
@@ -279,6 +293,7 @@ Native UI responsibilities:
 - Render the context selector as a lightweight combo overlay.
 - Render package version choices as a lightweight combo overlay.
 - When any modal dialog or selector is active, render the background content dimmed: it should lose color intensity and appear slightly darker while the modal remains visually dominant.
+- When a modal overlay or dialog has a title, embed the title elegantly into the top-left portion of the dialog border instead of placing it as a separate body line.
 - Use Unicode box-drawing characters for internal separators so table lines render as continuous terminal lines.
 - Do not draw far-left, far-right, top, or bottom boundary lines around the main table; preserving space is preferred.
 - Use Unicode arrow characters in the bottom key legend.
@@ -313,8 +328,9 @@ Context types:
 
 - `interpreter`: an installed or directly offered Python interpreter discovered by Tuv, including a current-working-directory Python distribution.
 - `venv`: a PEP 405 virtual environment found from the current working directory or from `VIRTUAL_ENV`.
-- `active`: the currently activated virtual environment from `VIRTUAL_ENV`, if present; this is listed with other venv contexts.
 - `tuv`: the selected Tuv runner venv from `TUV_RUNNER_VENV`; this is always listed last.
+
+The active virtual environment is not a separate context type in the state model. It is represented as `type=venv` with `source=active`, so it cannot be confused with an interpreter context.
 
 Context discovery order:
 
@@ -327,6 +343,7 @@ Current-working-directory interpreter detection:
 - `cwd` means the directory from which the user launched Tuv, not `TUV_HOME`.
 - If the current working directory contains a runnable Python interpreter, offer it as an `interpreter` context even when it is not installed system-wide.
 - If the current working directory contains `pyvenv.cfg`, classify it as a virtual environment instead of a cwd interpreter.
+- If a discovered Python executable reports `sys.prefix != sys.base_prefix`, classify it as a virtual environment executable and do not include it in the interpreter section.
 - On POSIX, check executable names such as `python`, `python3`, `bin/python`, and `bin/python3` under the current working directory.
 - On Windows, check executable names such as `python.exe`, `python3.exe`, `Scripts/python.exe`, and `bin/python.exe` under the current working directory.
 - Probe a current-working-directory interpreter with the same JSON probe used for installed interpreter discovery.
@@ -337,8 +354,10 @@ Virtual environment detection:
 
 - A directory is considered a virtual environment when it contains `pyvenv.cfg`.
 - The executable must exist at `bin/python` on POSIX or `Scripts/python.exe` on Windows.
-- v0.1 scans the current working directory and direct child directories.
-- A later version may add configurable recursive scanning depth.
+- Tuv scans the current working directory and direct child directories.
+- Deduplicate virtual environment contexts by resolved root path, and secondarily by resolved Python executable path.
+- If the same virtual environment is found through `VIRTUAL_ENV`, `.venv`, the current directory, and direct-child scanning, show one selector entry and preserve the most useful source labels, preferring `active` over `cwd` over `scanned`.
+- The active virtual environment must never appear in the interpreter section merely because its `python` executable is found on `PATH`.
 
 Default selected context:
 
@@ -417,9 +436,10 @@ Bottom indicator:
   - `F3`: open information for the focused row, especially install failure details.
   - `F4`: open a version selector for the focused package.
   - `F9`: focus and open the context selector.
+  - `F10`: quit the application when no modal dialog or selector is active.
 - May also include:
   - `R`: refresh package list.
-  - `Q`: quit.
+  - `Q`: quit when no modal dialog or selector is active.
 
 The bottom key legend must use Unicode arrows for arrow-key hints, for example `↑/↓ Row` and `←/→ Version`.
 The bottom key legend must use a Unicode enter symbol for the install key, for example `↵ Install`.
@@ -442,32 +462,50 @@ Outdated package list:
 - Use `<resolved-uv-provider> pip list --python <context> --outdated --format json`.
 - Merge outdated data into the installed package table.
 - Load and merge outdated data asynchronously after the initial installed package table is visible.
-- While outdated data is still loading, target versions may temporarily equal installed versions.
+- While outdated data and package index resolution are still loading, target versions may temporarily equal installed versions, but rows must remain non-installable loading/current placeholders rather than actionable `ready` rows.
 - Default target version:
   - Latest available version for outdated packages.
   - Installed version for current packages.
+- A row may become `ready` only after Tuv has completed successful version resolution for that package against the effective package index configuration and has confirmed the selected target is a real installable candidate.
 
 Version candidates:
 
 - `Left` chooses the next older known version.
 - `Right` chooses the next newer known version.
-- `Left` and `Right` must consider all available install versions for the focused package, not only the installed and latest versions.
-- If the full version list has not been loaded when `Left` or `Right` is pressed, Tuv should load it before applying the version change.
+- `Left` and `Right` must consider the complete available install-version list for the focused package, not only the installed version and latest version.
+- Pressing `Left` or `Right` before the complete version list has loaded must trigger candidate-version loading and apply the requested movement only after the list is available.
 - `F4` opens an overlay combo selector containing all known installable versions for the focused package.
-- In the version selector, `Enter` selects the highlighted version and starts installation for that package.
+- In the version selector, `Enter` selects the highlighted version and starts installation for that package only after the complete candidate-version list has loaded successfully.
+- While candidate-version lookup is loading or has failed, `Enter` in the version selector must not start installation.
 - In the version selector, `Esc` closes the selector without changing or installing.
 - Candidate versions should load lazily for the focused row.
-- Candidate version lookup should list all available installation versions from the configured package server or index where practical.
-- Candidate version lookup should respect uv index configuration where practical.
+- Candidate version lookup is core package-manager functionality and must be robust, testable, and treated as part of the package operation contract rather than a best-effort embellishment.
+- Candidate version lookup must enumerate available versions through the effective configured package index API, preferably the Python Simple Repository API, including PEP 503 HTML responses and PEP 691 JSON responses where supported by the index.
+- Candidate version lookup must use the same configured package server or index choices that uv will use for installation whenever those settings are discoverable, including index URL, extra index URL, credentials from supported environment variables, and local uv configuration files.
+- Tuv must not silently fall back to a different public index when the selected context or project has an explicit configured index that cannot be queried. In that case, keep installed package data visible, mark version data unavailable, and keep affected rows non-installable until the lookup succeeds.
+- Version lookup should use structured parsers for configuration and index responses where available; ad hoc regex parsing is acceptable only as a narrow fallback for formats that cannot otherwise be parsed.
+- Version lookup should preserve enough diagnostic detail to explain which index/config source failed.
+- If no project or environment-specific index configuration is discoverable, use the default Python package index.
+- Filter index results to installable distribution versions for the selected package name, normalize versions with `packaging`, and sort with PEP 440 ordering.
 - `uv` remains the authoritative installer and resolver. If metadata lookup offers a target that `uv` cannot install, surface the uv error and keep the row unchanged.
 
-The initial implementation may support only the installed version and latest version while the candidate-version provider is built out, but the UI and state model should already allow multiple target candidates.
+The initial implementation must implement the multi-version candidate provider before enabling `Left`, `Right`, or `F4` version navigation. A two-choice installed/latest-only implementation is not sufficient for these controls.
 
 Uninstall-safe marker:
 
-- Tuv should compute a reverse dependency view of installed packages for the selected context.
-- A package is marked with `* ` when no other installed package declares a dependency requirement satisfied by that package.
-- The marker is informational in v0.1; it does not add uninstall behavior.
+- Tuv should compute a reverse dependency view of installed packages for the selected context only from successful metadata collection that corresponds to the same installed package list currently displayed.
+- Metadata correspondence means the metadata result identifies the same selected context and refresh generation, and its package-name set matches the displayed installed rows closely enough to be trusted.
+- A package is marked with `* ` only when metadata collection succeeded, corresponds to the current table, and no other installed package declares a dependency requirement satisfied by that package.
+- If dependency metadata collection fails, is partial, stale, or does not correspond to the current installed package list, do not show uninstall-safe markers for that refresh.
+- The marker is informational; it does not add uninstall behavior.
+
+Package metadata and dependency relationships:
+
+- Tuv should combine multiple available techniques to identify package dependencies and usage relationships instead of relying on a single fragile source.
+- Preferred sources include installed distribution metadata read through the selected context's interpreter, `importlib.metadata` fields such as `Requires-Dist` and summary, metadata files under installed `.dist-info` directories, and uv-provided inspection output when it is available.
+- Dependency evaluation should normalize package names, evaluate environment markers for the selected context where possible, and ignore extras that are not active unless the installed metadata makes the extra relationship explicit.
+- The information panel should use the package summary or description metadata when available, preferring a short one-line summary over long project descriptions.
+- Failed or untrusted metadata must be surfaced as unavailable metadata, not converted into empty dependency and usage relationships.
 
 ## Installation Flow
 
@@ -476,14 +514,16 @@ When the user presses `Enter` on a package row:
 1. If the selected context is an interpreter context and has not been confirmed yet, show a confirmation dialog.
 2. Resolve the uv provider for the selected context using the provider hierarchy.
 3. If no uv provider is available or the resolved provider cannot operate on the selected context, repair or re-bootstrap `uv` in the Tuv runner venv. Do not offer to install `uv` into the selected context venv or interpreter.
-4. If the target version equals the installed version, do nothing and show a short status message.
-5. Mark the row as `installing`.
-6. Start an asynchronous background worker that runs `uv pip install`.
-7. Animate the fourth column while the process is running.
-8. Capture stdout, stderr, exit code, and elapsed time.
-9. After the uv process exits, refresh the entire package table for the selected context, because uv may update dependencies as part of the install.
-10. On success, show the refreshed package versions and clear the completed row status.
-11. On failure, mark the row as `failed`, render it bold red, and keep failure details available through `F3`.
+4. If the row is still loading installed data, outdated data, or candidate versions, do not install; keep the row non-installable and show a short status message that version resolution is still in progress.
+5. If the row's target version was not produced by successful candidate-version resolution for the effective index configuration, do not install.
+6. If the target version equals the installed version, do nothing and show a short status message.
+7. Mark the row as `installing`.
+8. Start an asynchronous background worker that runs `uv pip install`.
+9. Animate the fourth column while the process is running.
+10. Capture stdout, stderr, exit code, and elapsed time.
+11. After the uv process exits, refresh the entire package table for the selected context, because uv may update dependencies as part of the install.
+12. On success, show the refreshed package versions and clear the completed row status.
+13. On failure, mark the row as `failed`, render it bold red, and keep failure details available through `F3`.
 
 Install command:
 
@@ -493,9 +533,9 @@ Install command:
 
 `pip` and `uv` are not special-cased as package rows. If either package is installed in the selected context and appears in the table, Tuv may update it through the same explicit single-package or confirmed bulk-update flow as any other package. This permission does not allow Tuv to install `pip` or `uv` into a selected context as a hidden prerequisite for Tuv operation.
 
-For system interpreter contexts, pass the uv flags needed to explicitly opt into system mutation after user confirmation.
+For normal system interpreter contexts, pass `uv pip` flags needed to explicitly opt into system mutation after user confirmation, such as `--system` when required by uv for the selected target. Tuv does not support externally managed system Python mutation overrides such as `--break-system-packages`; if uv refuses because the interpreter is externally managed, surface that uv error and leave the context unchanged.
 
-Only one installation may run at a time. If the user presses `Enter` on another row while an installation is running, Tuv must not start a concurrent uv process. Instead, mark that requested row with the displayed status `Wait`. When the active installation finishes and the full package table refresh completes, Tuv may start the waiting installation if its package row and target version are still valid.
+Only one installation may run at a time. If the user presses `Enter` on another row while an installation is running, Tuv must not start a concurrent uv process. Instead, mark that requested row with the displayed status `Wait`. If the user presses `Enter` repeatedly on the same waiting row, keep the single existing wait request and keep displaying `Wait`; repeated key presses must not enqueue duplicate installs. When the active installation finishes and the full package table refresh completes, Tuv may start a waiting installation if its package row and target version are still valid.
 
 ## Update All Ready Packages
 
@@ -508,16 +548,16 @@ Bulk update rules:
 - Bulk update starts only after explicit positive confirmation.
 - If the selected context is an interpreter context that has not yet been confirmed for mutation, the bulk permission dialog must also serve as the interpreter installation confirmation.
 - In that case, the dialog must clearly state that the bulk update will install into the interpreter context; accepting it marks the interpreter context as confirmed for mutation.
-- Build the initial work list from rows whose normalized package name is unique, whose status is `ready`, and whose `updated_in_session` flag is false.
+- `F2` must not begin a bulk update while initial refresh, outdated lookup, or required target-version resolution is still in progress.
+- Build the initial work list only from rows whose normalized package name is unique, whose status is `ready`, and whose target version came from successful candidate-version resolution for the effective index configuration. Each queued item records the package name and the latest target version known at the moment the bulk run starts.
 - Run installs sequentially with the same asynchronous worker used for single-package installs.
 - Never start more than one uv install process at a time.
 - After each package install exits, refresh the full package table before choosing the next package.
 - Before starting each next package, re-check the refreshed row state.
-- Skip a package when it is already current, no longer ready, already installed or updated during the current session, or already processed in this bulk update run.
-- For the initial bulk work list, each queued package keeps its planned target version for the duration of that bulk run.
-- If a queued package was modified earlier in the same bulk run as a dependency of another install, do not treat that as completing the queued package unless its installed version now equals the queued target version.
-- Every planned bulk update must still be executed to its queued target version when its turn arrives, regardless of dependency-side modifications made by earlier installs.
-- If a package installation fails during a bulk update, keep that package in `failed` status and do not retry it during the same bulk update run.
+- Skip a package when it failed earlier in the current bulk run, was already processed in the current bulk run, is no longer present, or is already installed at the queued latest target version.
+- If a queued package was updated to its queued latest target version earlier in the same bulk run as a dependency-side effect of another install, treat it as complete and skip its own install step.
+- If a queued package is still waiting, has not failed in the current bulk run, and is not installed at its queued latest target version, run its planned update when its turn arrives even if dependency-side modifications changed its currently installed version.
+- If a package installation fails during a bulk update, keep that package in `failed` status, record its failure details, and do not retry it during the same bulk update run.
 - Mark the active row as `installing`; mark pending bulk rows as `wait` if they are visible.
 - Keep the TUI responsive throughout the bulk update.
 
@@ -526,11 +566,11 @@ Bulk update rules:
 The fourth table column displays one of these states:
 
 - `current`: installed version equals target version.
-- `ready`: target version differs from installed version and can be installed.
+- `ready`: target version differs from installed version, was produced by successful version resolution for the effective index configuration, and can be installed.
 - `loading`: target versions are being fetched.
 - `wait`: displayed as `Wait`; installation was requested while another installation is already running.
 - `installing`: install worker is running; show an animated spinner.
-- `skipped`: package was skipped by a bulk update because it was already current, already processed, or already installed or updated during the session.
+- `skipped`: package was skipped by a bulk update because it failed earlier in the current bulk run, was already processed, disappeared after refresh, or reached its queued latest target version before its own install step.
 - `done`: install completed successfully; short-lived before refresh.
 - `failed`: install failed; row is rendered bold red and remains selectable.
 
@@ -565,14 +605,23 @@ The information panel is package-focused:
 
 For every package row, the information panel must list:
 
+- Short package description: a concise summary from installed package metadata when available, or an explicit empty value when unavailable.
 - Dependency packages: installed packages required by the focused package.
 - Usage packages: installed packages that depend on the focused package.
 
-These lists should use normalized dependency metadata from the selected context. Empty lists should be shown explicitly as empty rather than omitted.
+These lists should use normalized dependency metadata from the selected context. Empty descriptions and empty lists should be shown explicitly as empty rather than omitted.
 
 ## Modal Behavior
 
 Every modal overlay or dialog must close with `Esc` or `q`.
+
+Modal titles:
+
+- Framed modal overlays and dialogs should render their title inside the top border near the top-left corner, for example a border shaped like `┌ Information ─────┐`.
+- The title should be separated from the left corner by a small amount of horizontal border, typically one border segment or one space, so it reads as part of the frame rather than as floating text.
+- The remaining top border should continue after the title so the frame still looks continuous.
+- The title must not consume a separate content row inside the modal body.
+- If the modal is too narrow to fit the full title, truncate the title within the top border rather than wrapping it or breaking the frame.
 
 Modal examples:
 
@@ -584,6 +633,8 @@ Modal examples:
 
 When `Esc` or `q` closes a permission or confirmation dialog, the associated action is cancelled.
 
+When no modal overlay or dialog is active, `q` quits the main application. `F10` also quits the main application. `q` must prefer closing the active modal over quitting the app whenever a modal is present.
+
 ## Error Handling
 
 Missing `uv`:
@@ -594,21 +645,28 @@ Missing `uv`:
 - Never ask to install `uv` into the selected context venv.
 - Never ask to install `uv` into the selected interpreter context.
 - If Tuv runner uv repair succeeds, continue.
-- If Tuv runner uv repair fails, exit with a clear message.
+- If Tuv runner uv repair fails after the TUI has started, show a clear failed state row that represents the Tuv runner uv repair failure, not a fake package row from the selected context.
+- The failed repair row should be visibly distinct as a Tuv operational error, include the failed runner path and repair command details through `F3`, and disable package mutation until repair succeeds on a later refresh or restart.
 - If the selected target context lacks both `uv` and `pip`, do not report missing `uv` as long as a resolved uv provider can manage that context with `--python <context>`.
 
 Broken Tuv runner venv:
 
-- Treat the runner venv as broken when the runner Python executable is missing, cannot execute the JSON probe, cannot import required runner dependencies after installation, or reports a base executable/prefix that no longer exists.
+- Treat the runner venv as broken when the runner Python executable is missing, cannot execute the JSON probe, cannot import required runner dependencies after installation, reports a base executable/prefix that no longer exists, or cannot be put into functional mode with working runner `pip` and runner `uv`.
 - When broken, mark that script-relative Tuv runner venv incompatible and select another compatible runner venv for the selected runner Python, or create a new hash-suffixed runner venv.
 - If the runner state marker records a compatibility key that does not match the selected runner Python and launcher mode, do not mutate that runner venv in place; select or create a compatible runner venv.
 - After selecting or creating a compatible runner venv, ensure runner pip, ensure runner uv, reinstall requirements when needed, rewrite the runner state marker, and launch `tuv.py`.
-- If repair fails, exit with a clear message that includes the runner path and the selected newest interpreter path.
+- If this launcher-time repair fails before `tuv.py` starts, exit with a clear message that includes the runner path and the selected newest interpreter path. In-app uv provider repair failures after alternate-screen startup follow the `Missing uv` behavior above and render a real Tuv operational failure row.
+
+Runner bootstrap failure:
+
+- If no compatible runner venv can be ensured because runner `pip`, runner `ensurepip`, runner `uv`, or required dependency installation fails, exit before entering the TUI and print a clear diagnostic.
+- If dependency installation fails because the network or configured package index is unavailable, explain that Tuv could not finish preparing its runner environment and that no selected target context was modified.
+- Do not report runner bootstrap network failures as missing selected-context `uv` or `pip`.
 
 No Python interpreter:
 
 - The launcher exits with a clear message.
-- Do not silently install Python in v0.1.
+- Do not silently install Python.
 - Mention that a Python interpreter must be installed before Tuv can run.
 
 Invalid or broken virtual environment:
@@ -621,6 +679,7 @@ Network/index errors:
 - Keep installed package data visible.
 - Mark target version data as unavailable.
 - Allow refresh.
+- Distinguish TUI package metadata/index failures from launcher-time runner bootstrap failures; the former keep the TUI open, while the latter exit gracefully before startup because Tuv cannot run without its own dependencies.
 
 Installation errors:
 
@@ -638,9 +697,16 @@ Suggested internal organization inside `tuv.py`:
 - Models: dataclasses for contexts, package rows, install jobs, and status values.
 - Discovery: newest Python interpreter discovery and virtual environment discovery.
 - uv backend: per-context uv provider resolution, subprocess wrapper for Python-module or standalone uv commands, and JSON parsing.
-- Versions: candidate target version lookup and version ordering.
+- Versions: index API candidate target version lookup and version ordering.
 - Native terminal UI: alternate-screen lifecycle, raw input handling, key decoding, redraw scheduling, widgets, key bindings, and rendering.
 - Installer: background install queue and result handling.
+
+Architecture hygiene:
+
+- Keep implementation helpers mapped to active behavior described by this specification.
+- Remove stale functions, dead state fields, old context types, and unused compatibility shims when their behavior is replaced.
+- Avoid retaining duplicate helper paths that compute the same concept differently, especially for dependency metadata, uninstall-safe markers, candidate versions, and runner repair.
+- Tests should cover active paths rather than stale helpers.
 
 Subprocess rules:
 
@@ -676,7 +742,7 @@ UvProvider
 
 PythonContext
   id: stable string
-  type: tuv | active | venv | interpreter
+  type: tuv | venv | interpreter
   source: tuv | active | cwd | installed | scanned
   label: display label
   python_path: absolute path
@@ -689,7 +755,10 @@ PythonContext
 PackageRow
   name: normalized distribution name
   display_name: package display name
+  description: short package description string or null
   uninstall_safe: bool
+  metadata_trusted: bool, true only when metadata corresponds to current refresh
+  versions_resolved: bool, true only when candidate versions came from effective index
   installed_version: version string
   target_version: version string
   candidate_versions: list of version strings
@@ -697,40 +766,57 @@ PackageRow
   updated_in_session: bool, true when installed or updated during current Tuv session
   last_error: string or null
   last_error_detail: string or null
+  last_install_result: InstallResult or null
 
 InstallJob
   context_id: string
   package_name: string
   target_version: string
   started_at: timestamp
+
+InstallResult
+  package_name: string
+  requested_version: string
+  installed_version_at_attempt: version string
+  exit_code: integer or null when process did not start
+  stdout_tail: list of strings
+  stderr_tail: list of strings
+  elapsed_seconds: float
+  failed_in_bulk_run_id: string or null
 ```
 
 ## Acceptance Criteria
 
-- Running `tuv.sh` on Linux/macOS or `tuv.bat` on Windows starts an alternate-screen TUI when Python is installed.
+- Running `tuv.sh` on Linux/macOS or `tuv.bat` on Windows starts an alternate-screen TUI when Python is installed and the Tuv runner environment can be ensured.
 - The launcher uses script-relative paths for `tuv.py`, `requirements.txt`, and the runner venv.
 - New runner venvs are created directly under `TUV_HOME` with names like `tuv-venv-1a3b8e4f`; legacy `.tuv-venv` may be reused only when compatible.
 - The launcher discovers the newest usable platform Python interpreter for default launches.
+- The launcher does not classify an active or project virtual environment Python from `PATH` as a platform interpreter.
 - When started with the literal dot argument `.` as in `tuv .`, the launcher uses current-working-directory Python as the runner Python and does not fall back to platform discovery.
 - After selecting runner Python, the launcher reuses a compatible Tuv runner venv or creates a novel hash-suffixed runner venv when none is compatible.
 - The launcher uses the selected runner Python for the Tuv runner venv and for Tuv-owned venv management.
-- The launcher starts by ensuring the Tuv runner venv has working `pip` and `uv`; neither dependency is required in the base interpreter.
+- The launcher starts by ensuring the Tuv runner venv reaches functional mode with working runner `pip` and runner `uv`; neither dependency is required in the base interpreter.
+- If runner `pip`, runner `ensurepip`, and runner `uv` cannot make the runner venv functional, the launcher exits gracefully with an informative bootstrap message.
+- If a compatible runner environment cannot be ensured because network or index access is unavailable, Tuv exits gracefully before entering alternate-screen mode and explains that runner dependency bootstrap failed.
 - If the runner Python is missing, broken, points at a removed base interpreter, or is incompatible with the selected runner Python and launcher mode, the launcher selects or creates a compatible runner venv before launching Tuv.
 - Tuv resolves uv providers in this priority order for package operations: selected context venv uv, selected context reference interpreter uv, standalone system uv, Tuv runner venv uv.
 - Tuv detects standalone system `uv` when available, but uses it only after more local context providers are unavailable.
 - The launcher does not require standalone `uv` on `PATH`.
 - If no uv provider is available, Tuv repairs or installs `uv` into the Tuv runner venv and continues when repair succeeds.
+- If Tuv runner uv repair fails after the TUI has started, Tuv shows a real Tuv operational failure row, not a fake selected-context package row.
 - Tuv never offers to install `uv` into a selected context venv or selected interpreter context.
 - Tuv may update `pip` and `uv` in the selected context only when they are normal package rows selected by the user or included in a confirmed bulk update.
 - Tuv never installs `pip` or `uv` into a selected context as a hidden prerequisite for Tuv operation.
 - If standalone system `uv` or Tuv runner venv `uv` is available, Tuv can inspect and manage a target Python distribution that lacks both `uv` and `pip`.
-- Tuv enters the alternate-screen UI immediately after launch instead of blocking startup on latest-version lookup.
+- Tuv treats snappy startup as a design requirement: after launcher bootstrap completes, it enters the alternate-screen UI without blocking on latest-version lookup or candidate-version enumeration.
 - The context selector always includes `tuv venv`.
 - The context selector lists interpreter contexts first, virtual environment contexts second, and `tuv venv` last.
 - A current working directory that contains a runnable Python interpreter is offered as an interpreter context even when that interpreter is not installed or discoverable by usual system methods.
 - `F9` focuses and opens the context selector combo.
 - Selecting a context loads packages for that context.
 - Installed packages are rendered first, and latest target versions are updated asynchronously after the table is visible.
+- Rows are not actionable for `Enter`, version-selector `Enter`, or `F2` bulk update until required version resolution for those rows has completed successfully.
+- Active virtual environments are listed as virtual environment contexts and are not duplicated as interpreter contexts.
 - The table contains package name, installed version, target version, and action/status columns.
 - The top status bar starts directly with selected context data, without a leading `Context:` label or idle/status text.
 - The table uses Unicode separator lines and does not render broken ASCII-style lines.
@@ -744,47 +830,55 @@ InstallJob
 - `Up/Down` changes the focused package row by one row.
 - `PageUp/PageDown` jumps quickly through table rows.
 - `Left/Right` changes the focused row target version.
-- `Left/Right` uses all available install versions for the focused package.
+- `Left/Right` uses the complete available install-version list for the focused package, not only installed and latest.
+- Candidate versions are robustly enumerated through the effective configured package index API and sorted with PEP 440 semantics.
 - `F4` opens an overlay combo listing all known installable versions for the focused package.
-- `Enter` in the version selector starts installation of the highlighted version.
+- `Enter` in the version selector starts installation of the highlighted version only after the complete candidate-version list has loaded successfully.
 - `Esc` closes the version selector.
-- `q` closes modal dialogs and selectors the same way as `Esc`.
+- `q` closes modal dialogs and selectors the same way as `Esc`; when no modal is active, `q` quits the main app.
+- `F10` quits the main app when no modal is active.
 - Active modal dialogs and selectors dim the background content behind them.
+- Modal dialog and selector titles are embedded into the top-left portion of their top border, not rendered as a separate body line.
 - `Enter` installs the selected target version through the resolved uv provider.
+- `Enter` on a loading, unresolved, or version-lookup-failed row does not start installation.
+- System interpreter installs use normal explicit system mutation only after confirmation and do not use externally managed override flags.
 - `F2` asks for permission, then updates all ready packages sequentially only after confirmation.
-- Bulk update skips packages already installed or updated during the current session and does not install any package twice.
+- Bulk update skips packages that failed earlier in the current bulk run, packages already processed in the current bulk run, and queued packages that reached their queued latest target version as a dependency-side effect.
 - The fourth column shows an animated installation indicator while uv is running.
 - Installations run asynchronously and do not block table navigation, context selector access, or `F3` information panels.
 - If `Enter` requests another installation while one is running, the requested row displays `Wait` and no concurrent uv install starts.
 - A failed installation row is rendered bold red.
 - `F3` opens package-focused information for the focused row and shows failure details for failed rows.
 - `F3` labels the installed package version as `Version`.
+- `F3` shows a short package description plus dependency and usage packages for every row.
 - `F3` omits known versions, target version, uninstall marker, row status, and context/interpreter details.
 - The TUI remains responsive during installation.
 - After any completed installation, the full package table refreshes so dependency updates made by uv are reflected.
 - Packages installed or updated during the current Tuv session are colored white after refresh.
 - Current packages are colored light green unless a higher-priority row style applies.
 - Package rows show `* ` before the package name when that package can be uninstalled without breaking dependency requirements.
+- Package rows show `* ` only after trusted metadata matching the current displayed package table is available.
+- Dependency and usage relationships are derived from multiple available metadata sources and normalized for the selected context.
 - Failures are visible, recoverable, and do not terminate the application.
 - Every modal overlay or dialog closes with `Esc` or `q`.
 
 ## Implementation Milestones
 
 1. Create `tuv.sh`, `tuv.bat`, `tuv.py`, and `requirements.txt`.
-2. Implement newest Python discovery in both launchers, including current-working-directory interpreter detection.
+2. Implement newest Python discovery in both launchers, including current-working-directory interpreter detection and exclusion of virtual environment interpreters from default platform discovery.
 3. Implement uv provider resolution with the context venv, reference interpreter, standalone system, and Tuv runner venv hierarchy.
 4. Create and repair script-relative hash-suffixed runner venvs under `TUV_HOME`, including compatible-runner selection, explicit `tuv .` cwd-runner mode, missing/broken runner Python, and incompatible-runner replacement.
 5. Add native alternate-screen app shell with static header, table, and footer key hints.
-6. Implement context discovery, including interpreter-first ordering, current-working-directory interpreter contexts, and always-last `tuv venv`.
+6. Implement context discovery, including interpreter-first ordering, current-working-directory interpreter contexts, virtual environment deduplication, and always-last `tuv venv`.
 7. Implement `F9` context selector combo behavior.
 8. Implement uv-backed package listing and outdated merge.
-9. Implement row navigation and `Left/Right` target version state.
+9. Implement row navigation and `Left/Right` target version state backed by complete index-enumerated candidate versions.
 10. Implement version selector overlay with `F4`, `Enter`, and `Esc`.
 11. Implement install worker and row status loop.
 12. Implement `F2` sequential update-all-ready flow.
 13. Add uninstall-safe package marker.
 14. Add bold-red failed row rendering and `F3` information panel.
-15. Add tests for discovery, explicit `tuv .` cwd-runner mode, runner compatibility and hash-suffixed venv selection, uv provider hierarchy resolution, Tuv-runner pip and uv bootstrap, runner repair, uv JSON parsing, context ordering, current-working-directory interpreter detection, version selection, bulk update sequencing, and install state transitions.
+15. Add tests for discovery, explicit `tuv .` cwd-runner mode, runner compatibility and hash-suffixed venv selection, uv provider hierarchy resolution, Tuv-runner pip and uv bootstrap, runner repair, uv JSON parsing, context ordering, active-venv classification, virtual environment deduplication, current-working-directory interpreter detection, robust effective-index-backed version selection, action gating before version resolution, metadata trust gating for uninstall-safe markers, bulk update sequencing, failure detail state, and install state transitions.
 
 ## References
 
@@ -794,6 +888,7 @@ InstallJob
 - uv environment behavior: https://docs.astral.sh/uv/pip/environments/
 - uv package inspection: https://docs.astral.sh/uv/pip/inspection/
 - uv CLI reference: https://docs.astral.sh/uv/reference/cli/
+- Python Simple Repository API: https://packaging.python.org/en/latest/specifications/simple-repository-api/
 
 ## Bug Counterexamples
 
@@ -803,18 +898,27 @@ These examples describe behavior that must be treated as bugs and covered by reg
 - `Esc` key does not close the information dialog.
 - `Esc` key does not close the context selector.
 - `q` key does not close any modal dialog or selector in the same way as `Esc`.
+- Pressing `q` with no modal open does not quit the main application.
+- Pressing `F10` with no modal open does not quit the main application.
 - Large information dialog content is not scrollable as expected.
 - In the version selector, moving selection down scrolls the entire content upward while the selection marker stays at the top; the marker should move down until it reaches the visible selector boundary.
-- Tuv takes 1 second to start and show the initial screen; this is not acceptable because the first visual frame must be established in less than 100 ms.
+- A modal dialog title is rendered as a separate first body line instead of being embedded into the top-left border.
+- After launcher bootstrap completes, Tuv blocks the first TUI frame on latest-version or candidate-version lookup instead of showing installed package data promptly.
 - Tuv emits sounds, such as terminal beeps; this should never happen.
 - Pressing `F2` starts installation of one package but then does not proceed with the rest of the packages that were previously waiting.
+- Pressing `Enter`, version-selector `Enter`, or `F2` starts an install while version lookup is still loading, unresolved, failed, or based on stale index data.
+- Pressing `Enter` repeatedly on a waiting row queues duplicate installs for that same row.
 - A selected venv contains a working `uv`, but Tuv uses standalone system `uv` instead.
 - A selected interpreter can run `python -m uv`, but Tuv uses standalone system `uv` instead.
 - Tuv prompts to install `uv` into a selected project venv or interpreter context.
+- Tuv runner uv repair fails after the TUI has started, and Tuv renders a fake selected-context package row instead of a clear Tuv operational failure row.
 - Standalone `uv` is available, but Tuv prompts to install `uv` into the newest Python interpreter.
 - The base interpreter lacks `pip` or `uv`, and Tuv fails instead of creating the runner venv and bootstrapping runner-local `pip` and `uv`.
+- The selected runner venv lacks working `pip`, `uv`, and usable `ensurepip`, but Tuv starts anyway instead of reporting that no functional runner environment can be ensured.
+- Runner dependency bootstrap fails because the package index or network is unavailable, and Tuv enters alternate-screen mode or reports a misleading selected-context error.
 - The Tuv runner venv Python executable exists but cannot run, and the launcher still tries to use it instead of repairing the runner venv.
 - A newer usable Python interpreter is available, but the Tuv runner venv remains pinned to an older interpreter after startup.
+- An active virtual environment Python found on `PATH` is selected as the default platform runner Python.
 - `tuv .` is launched from a directory containing a usable Python, but the launcher chooses a platform Python instead.
 - `tuv .` is launched from a directory without usable Python, but the launcher silently falls back to platform Python instead of failing clearly.
 - The selected runner Python changes, but Tuv mutates an incompatible existing runner venv in place instead of selecting or creating a compatible hash-suffixed runner venv.
@@ -823,3 +927,9 @@ These examples describe behavior that must be treated as bugs and covered by reg
 - A target Python distribution without `uv` or `pip` is rejected even though standalone system uv or Tuv runner venv uv can manage it through `--python`.
 - The current working directory contains a runnable Python interpreter, but no corresponding interpreter context appears in the context selector.
 - `tuv venv` appears before interpreter or project virtual environment contexts in the context selector.
+- The same virtual environment appears more than once in the context selector through `VIRTUAL_ENV`, `.venv`, and scanned child discovery.
+- `Left` or `Right` only toggles between installed and latest instead of traversing all index-enumerated installable versions.
+- `F3` omits failure exit code, stdout/stderr tails, elapsed time, short description, or dependency/usage relationships required by the information panel.
+- Dependency metadata collection fails, but all packages are marked with `* ` as though metadata proved they are uninstall-safe.
+- Version lookup silently falls back to a different public package index when the selected context has an explicit configured index that failed.
+- Dead helper functions or stale state fields remain after behavior is replaced, causing future changes to target inactive code paths.

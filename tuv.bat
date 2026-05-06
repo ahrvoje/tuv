@@ -79,12 +79,30 @@ if not defined TUV_RUNNER_PYTHON (
 )
 
 "%TUV_RUNNER_PYTHON%" -m pip --version >nul 2>nul
-if errorlevel 1 "%TUV_RUNNER_PYTHON%" -m ensurepip --upgrade
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+  set "BOOTSTRAP_STEP=runner pip is unavailable and ensurepip could not restore it"
+  "%TUV_RUNNER_PYTHON%" -m ensurepip --upgrade
+  if errorlevel 1 goto runner_bootstrap_failed
+)
+
+"%TUV_RUNNER_PYTHON%" -m pip --version >nul 2>nul
+if errorlevel 1 (
+  set "BOOTSTRAP_STEP=runner pip is unavailable after ensurepip"
+  goto runner_bootstrap_failed
+)
 
 "%TUV_RUNNER_PYTHON%" -m uv --version >nul 2>nul
-if errorlevel 1 "%TUV_RUNNER_PYTHON%" -m pip install uv
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+  set "BOOTSTRAP_STEP=runner uv is unavailable and could not be installed; network or package index access may be unavailable"
+  "%TUV_RUNNER_PYTHON%" -m pip install uv
+  if errorlevel 1 goto runner_bootstrap_failed
+)
+
+"%TUV_RUNNER_PYTHON%" -m uv --version >nul 2>nul
+if errorlevel 1 (
+  set "BOOTSTRAP_STEP=runner uv is unavailable after installation"
+  goto runner_bootstrap_failed
+)
 
 set "REQ_HASH="
 for /f "tokens=1" %%H in ('certutil -hashfile "%REQ%" SHA256 ^| findstr /R "^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]"') do if not defined REQ_HASH set "REQ_HASH=%%H"
@@ -94,14 +112,20 @@ if exist "%STATE%" set /p STATE_HASH=<"%STATE%"
 
 if not "%REQ_HASH%"=="%STATE_HASH%" (
   "%TUV_RUNNER_PYTHON%" -m pip install -r "%REQ%"
-  if errorlevel 1 exit /b 1
+  if errorlevel 1 (
+    set "BOOTSTRAP_STEP=requirements could not be installed; network or package index access may be unavailable"
+    goto runner_bootstrap_failed
+  )
   > "%STATE%" echo(%REQ_HASH%
 )
 
 "%TUV_RUNNER_PYTHON%" -c "import packaging" >nul 2>nul
 if errorlevel 1 (
   "%TUV_RUNNER_PYTHON%" -m pip install -r "%REQ%"
-  if errorlevel 1 exit /b 1
+  if errorlevel 1 (
+    set "BOOTSTRAP_STEP=requirements could not be installed; network or package index access may be unavailable"
+    goto runner_bootstrap_failed
+  )
   > "%STATE%" echo(%REQ_HASH%
 )
 
@@ -114,3 +138,9 @@ if defined TUV_SYSTEM_UV_EXE (
 
 "%TUV_RUNNER_PYTHON%" "%APP%" %FORWARD_ARGS%
 exit /b %ERRORLEVEL%
+
+:runner_bootstrap_failed
+echo Tuv runner bootstrap failed: %BOOTSTRAP_STEP% 1>&2
+echo Runner Python: %TUV_RUNNER_PYTHON% 1>&2
+echo Runner venv: %TUV_RUNNER_VENV% 1>&2
+exit /b 1

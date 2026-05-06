@@ -10,7 +10,7 @@ Main package table:
 
 Package information dialog:
 
-![Tuv package information dialog](tuv_demo_2.png)
+![Tuv package information dialog](tuv_demo_3.png)
 
 ## Highlights
 
@@ -35,7 +35,31 @@ Linux and macOS:
 ./tuv.sh
 ```
 
-The launcher discovers the newest usable Python, creates the runner environment at `.tuv-venv`, installs `requirements.txt`, and starts `tuv.py`. If the selected Python cannot run `uv`, Tuv asks before installing it.
+Run Tuv from a project directory to make its local Python and virtual environments easy to pick in the context selector:
+
+```bat
+cd C:\projects\my-app
+tuv.bat
+```
+
+```sh
+cd ~/projects/my-app
+./tuv.sh
+```
+
+Use the dot argument when you explicitly want the current directory's Python to be used as Tuv's runner Python:
+
+```bat
+cd C:\tools\python-3.13
+tuv.bat .
+```
+
+```sh
+cd ~/tools/python-3.13
+./tuv.sh .
+```
+
+The launcher discovers a usable Python, creates or reuses a script-relative runner environment, installs `requirements.txt`, ensures runner-local `uv`, and starts `tuv.py`.
 
 ## Keys
 
