@@ -145,6 +145,7 @@ class PackageRow:
     status: str
     metadata_trusted: bool = False
     versions_resolved: bool = False
+    color_hint: str | None = None
     dependency_packages: list[str] = field(default_factory=list)
     usage_packages: list[str] = field(default_factory=list)
     description: str | None = None
@@ -198,6 +199,7 @@ class Prompt:
 class PackageMetadata:
     description: str | None = None
     dependencies: set[str] = field(default_factory=set)
+    extras: set[str] = field(default_factory=set)
 
 
 def version_key(value: str) -> tuple[int, object]:
@@ -983,19 +985,30 @@ def norm(value):
 
 result = {}
 
-def put(name, summary, requires):
+def implementation_version():
+    version = sys.implementation.version
+    suffix = "" if version.releaselevel == "final" else version.releaselevel[0] + str(version.serial)
+    return f"{version.major}.{version.minor}.{version.micro}{suffix}"
+
+def put(name, summary, requires, extras):
     if not name:
         return
-    key = norm(name)
-    current = result.setdefault(key, {"name": name, "summary": "", "requires": []})
+    key = norm(str(name))
+    current = result.setdefault(key, {"name": name, "summary": "", "requires": [], "extras": []})
     if summary and not current["summary"]:
         current["summary"] = str(summary)
     current["requires"].extend(str(req) for req in (requires or []) if req)
+    current["extras"].extend(str(extra) for extra in (extras or []) if extra)
 
 try:
     for dist in metadata.distributions():
         meta = dist.metadata
-        put(meta.get("Name"), meta.get("Summary"), list(dist.requires or meta.get_all("Requires-Dist") or []))
+        put(
+            meta.get("Name"),
+            meta.get("Summary"),
+            list(dist.requires or meta.get_all("Requires-Dist") or []),
+            meta.get_all("Provides-Extra") or [],
+        )
 except Exception:
     pass
 
@@ -1009,13 +1022,18 @@ for base in list(sys.path):
                 msg = email.parser.Parser().parsestr(meta_path.read_text(encoding="utf-8", errors="replace"))
             except Exception:
                 continue
-            put(msg.get("Name"), msg.get("Summary"), msg.get_all("Requires-Dist") or [])
+            put(
+                msg.get("Name"),
+                msg.get("Summary"),
+                msg.get_all("Requires-Dist") or [],
+                msg.get_all("Provides-Extra") or [],
+            )
     except Exception:
         continue
 
 env = {
     "implementation_name": sys.implementation.name,
-    "implementation_version": platform.python_version(),
+    "implementation_version": implementation_version(),
     "os_name": os.name,
     "platform_machine": platform.machine(),
     "platform_python_implementation": platform.python_implementation(),
@@ -1030,6 +1048,7 @@ env = {
 
 for value in result.values():
     value["requires"] = sorted(set(value["requires"]))
+    value["extras"] = sorted(set(value["extras"]))
 
 print(json.dumps({"packages": result, "environment": env}))
 """
@@ -1058,37 +1077,96 @@ print(json.dumps({"packages": result, "environment": env}))
             continue
         summary = item.get("summary")
         requires = item.get("requires", [])
+        if not isinstance(requires, list):
+            requires = []
+        raw_extras = item.get("extras", [])
+        extras = (
+            {str(extra).strip() for extra in raw_extras if str(extra).strip()}
+            if isinstance(raw_extras, list)
+            else set()
+        )
+        for req in requires:
+            if isinstance(req, str):
+                extras.update(extra_names_from_requirement(req))
         deps = {
             dep
             for req in requires
             if isinstance(req, str)
-            for dep in [dependency_name_from_requirement(req, marker_env)]
+            for dep in [dependency_name_from_requirement(req, marker_env, extras)]
             if dep
         }
         result[canonicalize_name(package_name)] = PackageMetadata(
             description=short_description(summary),
             dependencies=deps,
+            extras={canonicalize_name(extra) for extra in extras},
         )
     return result
 
 
-def dependency_name_from_requirement(requirement: str, marker_env: dict[str, object]) -> str | None:
+def dependency_name_from_requirement(
+    requirement: str,
+    marker_env: dict[str, object],
+    extras: set[str] | None = None,
+) -> str | None:
     if Requirement is not None:
         try:
             parsed = Requirement(requirement)
             if parsed.marker is not None:
-                env = dict(default_environment() if default_environment is not None else {})
-                env.update({str(key): str(value) for key, value in marker_env.items()})
-                try:
-                    if not parsed.marker.evaluate(environment=env):
-                        return None
-                except Exception:
-                    pass
+                if not requirement_marker_applies(parsed.marker, marker_env, extras or set()):
+                    return None
             return canonicalize_name(parsed.name)
         except InvalidRequirement:
             pass
     head = re.split(r"[<>=!~;\[\s(]", requirement, 1)[0].strip()
     return canonicalize_name(head) if head else None
+
+
+def requirement_marker_applies(
+    marker: object,
+    marker_env: dict[str, object],
+    extras: set[str],
+) -> bool:
+    env = dict(default_environment() if default_environment is not None else {})
+    env.update({str(key): str(value) for key, value in marker_env.items()})
+    extra_values = ["", *extra_marker_values(extras)]
+    try:
+        for extra in extra_values:
+            env["extra"] = extra
+            if marker.evaluate(environment=env):  # type: ignore[attr-defined]
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def extra_marker_values(extras: set[str]) -> list[str]:
+    values: set[str] = set()
+    for extra in extras:
+        raw = str(extra).strip()
+        if not raw:
+            continue
+        normalized = canonicalize_name(raw)
+        values.add(raw)
+        values.add(normalized)
+        values.add(normalized.replace("-", "_"))
+    return sorted(values)
+
+
+def extra_names_from_requirement(requirement: str) -> set[str]:
+    values: set[str] = set()
+    if Requirement is not None:
+        try:
+            parsed = Requirement(requirement)
+            if parsed.marker is not None:
+                requirement = str(parsed.marker)
+        except InvalidRequirement:
+            pass
+    for match in re.finditer(r"\bextra\s*(?:==|!=|in|not\s+in)\s*(['\"])(.*?)\1", requirement, re.IGNORECASE):
+        for value in re.split(r"[,\s]+", match.group(2)):
+            cleaned = value.strip()
+            if cleaned:
+                values.add(cleaned)
+    return values
 
 
 def short_description(value: object) -> str | None:
@@ -1885,6 +1963,7 @@ class TuvApp:
             for row in rows:
                 row.updated_in_session = row.name in updated_names
 
+        self.carry_refresh_color_hints(rows)
         self.rows = rows
         self.focus_index = min(self.focus_index, max(0, len(self.rows) - 1))
         self.scroll = min(self.scroll, max(0, len(self.rows) - 1))
@@ -2090,11 +2169,30 @@ class TuvApp:
         before_versions: dict[str, str],
         rows: list[PackageRow],
     ) -> None:
+        if not before_versions:
+            return
         changed = self.updated_by_context.setdefault(context_id, set())
         for row in rows:
             previous = before_versions.get(row.name)
             if previous is None or previous != row.installed_version:
                 changed.add(row.name)
+
+    def carry_refresh_color_hints(self, rows: list[PackageRow]) -> None:
+        previous_hints = {row.name: self.row_color_hint(row) for row in self.rows}
+        for row in rows:
+            if row.status == "loading":
+                row.color_hint = previous_hints.get(row.name)
+
+    def row_color_hint(self, row: PackageRow) -> str | None:
+        if row.updated_in_session:
+            return "updated"
+        if row.status == "current":
+            return "current"
+        if row.is_outdated:
+            return "outdated"
+        if row.status == "loading":
+            return row.color_hint
+        return None
 
     def mark_failed_row(self, result: InstallResult) -> None:
         if self.bulk_active:
@@ -2796,16 +2894,19 @@ class TuvApp:
         )
         line = text[:width].ljust(width)
         style = ""
+        loading_color_hint = row.color_hint if row.status == "loading" else None
         if index == self.focus_index:
             style += REVERSE
         if row.status == "failed":
             style += BOLD_RED
-        elif row.updated_in_session:
+        elif row.updated_in_session or loading_color_hint == "updated":
             style += WHITE
-        elif row.status == "current":
+        elif row.status == "current" or loading_color_hint == "current":
             style += LIGHT_GREEN
-        elif row.is_outdated:
+        elif row.is_outdated or loading_color_hint == "outdated":
             style += YELLOW
+        elif row.status == "loading":
+            style += DIM
         if style:
             return style + line + RESET
         return line

@@ -20,6 +20,8 @@ shift
 goto collect_args
 
 :args_done
+1>&2 echo(tuv: starting (launcher mode: %LAUNCHER_MODE%)
+
 if not exist "%APP%" (
   echo tuv.py was not found in %TUV_HOME% 1>&2
   exit /b 1
@@ -44,6 +46,7 @@ for /f "delims=" %%T in ('powershell -NoProfile -Command "[IO.Path]::Combine($en
 >> "%FIND_PS%" echo foreach ($p in ($c ^| Where-Object { $_ } ^| Select-Object -Unique)) { if (Test-Path $p) { $out = ^& $p -c "import sys; print(str(sys.version_info[0]) + ' ' + str(sys.version_info[1]) + ' ' + str(sys.version_info[2]) + ' ' + sys.executable)" 2^>^&1 ^| Out-String; if ($LASTEXITCODE -eq 0 -and $out -match '^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$') { $infos += [pscustomobject]@{Major=[int]$Matches[1]; Minor=[int]$Matches[2]; Patch=[int]$Matches[3]; Path=(Resolve-Path $Matches[4]).Path} } } }
 >> "%FIND_PS%" echo $infos ^| Sort-Object Major, Minor, Patch -Descending ^| Select-Object -First 1 -ExpandProperty Path
 
+1>&2 echo(tuv: discovering runner Python
 for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%FIND_PS%"`) do set "BOOTSTRAP_PYTHON=%%P"
 del "%FIND_PS%" >nul 2>nul
 
@@ -51,9 +54,11 @@ if not defined BOOTSTRAP_PYTHON (
   echo No usable Python interpreter was found. 1>&2
   exit /b 1
 )
+1>&2 echo(tuv: runner Python: %BOOTSTRAP_PYTHON%
 
 set "TUV_HOME=%TUV_HOME%"
 for /f "delims=" %%T in ('powershell -NoProfile -Command "[IO.Path]::Combine($env:TEMP, 'tuv-runner-' + [IO.Path]::GetRandomFileName() + '.txt')"') do set "PREP_OUT=%%T"
+1>&2 echo(tuv: preparing runner environment
 "%BOOTSTRAP_PYTHON%" "%APP%" --prepare-runner --launcher-mode "%LAUNCHER_MODE%" > "%PREP_OUT%"
 if errorlevel 1 (
   type "%PREP_OUT%" 1>&2
@@ -77,10 +82,13 @@ if not defined TUV_RUNNER_PYTHON (
   echo Tuv runner preparation did not return a runner Python. 1>&2
   exit /b 1
 )
+1>&2 echo(tuv: runner venv: %TUV_RUNNER_VENV%
 
+1>&2 echo(tuv: ensuring runner pip
 "%TUV_RUNNER_PYTHON%" -m pip --version >nul 2>nul
 if errorlevel 1 (
   set "BOOTSTRAP_STEP=runner pip is unavailable and ensurepip could not restore it"
+  1>&2 echo(tuv: restoring runner pip with ensurepip
   "%TUV_RUNNER_PYTHON%" -m ensurepip --upgrade
   if errorlevel 1 goto runner_bootstrap_failed
 )
@@ -91,9 +99,11 @@ if errorlevel 1 (
   goto runner_bootstrap_failed
 )
 
+1>&2 echo(tuv: ensuring runner uv
 "%TUV_RUNNER_PYTHON%" -m uv --version >nul 2>nul
 if errorlevel 1 (
   set "BOOTSTRAP_STEP=runner uv is unavailable and could not be installed; network or package index access may be unavailable"
+  1>&2 echo(tuv: installing runner uv
   "%TUV_RUNNER_PYTHON%" -m pip install uv
   if errorlevel 1 goto runner_bootstrap_failed
 )
@@ -110,7 +120,9 @@ set "STATE=%TUV_RUNNER_VENV%\.tuv-requirements-state"
 set "STATE_HASH="
 if exist "%STATE%" set /p STATE_HASH=<"%STATE%"
 
+1>&2 echo(tuv: checking runner requirements
 if not "%REQ_HASH%"=="%STATE_HASH%" (
+  1>&2 echo(tuv: installing runner requirements
   "%TUV_RUNNER_PYTHON%" -m pip install -r "%REQ%"
   if errorlevel 1 (
     set "BOOTSTRAP_STEP=requirements could not be installed; network or package index access may be unavailable"
@@ -121,6 +133,7 @@ if not "%REQ_HASH%"=="%STATE_HASH%" (
 
 "%TUV_RUNNER_PYTHON%" -c "import packaging" >nul 2>nul
 if errorlevel 1 (
+  1>&2 echo(tuv: repairing runner requirements
   "%TUV_RUNNER_PYTHON%" -m pip install -r "%REQ%"
   if errorlevel 1 (
     set "BOOTSTRAP_STEP=requirements could not be installed; network or package index access may be unavailable"
@@ -129,13 +142,16 @@ if errorlevel 1 (
   > "%STATE%" echo(%REQ_HASH%
 )
 
+1>&2 echo(tuv: checking system uv provider
 set "TUV_SYSTEM_UV_EXE="
 for /f "delims=" %%U in ('where uv 2^>nul') do if not defined TUV_SYSTEM_UV_EXE set "TUV_SYSTEM_UV_EXE=%%U"
 if defined TUV_SYSTEM_UV_EXE (
   "%TUV_SYSTEM_UV_EXE%" --version >nul 2>nul
   if errorlevel 1 set "TUV_SYSTEM_UV_EXE="
 )
+if defined TUV_SYSTEM_UV_EXE 1>&2 echo(tuv: system uv provider: %TUV_SYSTEM_UV_EXE%
 
+1>&2 echo(tuv: entering terminal UI
 "%TUV_RUNNER_PYTHON%" "%APP%" %FORWARD_ARGS%
 exit /b %ERRORLEVEL%
 

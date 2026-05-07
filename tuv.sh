@@ -6,10 +6,16 @@ REQ="$TUV_HOME/requirements.txt"
 APP="$TUV_HOME/tuv.py"
 LAUNCHER_MODE="default"
 
+progress() {
+  printf 'tuv: %s\n' "$*" >&2
+}
+
 if [ "${1:-}" = "." ]; then
   LAUNCHER_MODE="cwd"
   shift
 fi
+
+progress "starting (launcher mode: $LAUNCHER_MODE)"
 
 if [ ! -f "$APP" ]; then
   echo "tuv.py was not found in $TUV_HOME" >&2
@@ -83,13 +89,16 @@ $path"
   printf '%s' "$newest"
 }
 
+progress "discovering runner Python"
 BOOTSTRAP_PYTHON=$(find_bootstrap_python)
 if [ -z "$BOOTSTRAP_PYTHON" ]; then
   echo "No usable Python interpreter was found." >&2
   exit 1
 fi
+progress "runner Python: $BOOTSTRAP_PYTHON"
 
 export TUV_HOME
+progress "preparing runner environment"
 if ! PREP_OUTPUT=$("$BOOTSTRAP_PYTHON" "$APP" --prepare-runner --launcher-mode "$LAUNCHER_MODE" 2>&1); then
   echo "$PREP_OUTPUT" >&2
   exit 1
@@ -108,8 +117,11 @@ if [ -z "${TUV_RUNNER_VENV:-}" ] || [ -z "${TUV_RUNNER_PYTHON:-}" ]; then
   echo "Tuv runner preparation did not return a runner venv." >&2
   exit 1
 fi
+progress "runner venv: $TUV_RUNNER_VENV"
 
+progress "ensuring runner pip"
 if ! "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1; then
+  progress "restoring runner pip with ensurepip"
   "$TUV_RUNNER_PYTHON" -m ensurepip --upgrade || fail_bootstrap "runner pip is unavailable and ensurepip could not restore it"
 fi
 
@@ -117,7 +129,9 @@ if ! "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1; then
   fail_bootstrap "runner pip is unavailable after ensurepip"
 fi
 
+progress "ensuring runner uv"
 if ! "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1; then
+  progress "installing runner uv"
   "$TUV_RUNNER_PYTHON" -m pip install uv || fail_bootstrap "runner uv is unavailable and could not be installed; network or package index access may be unavailable"
 fi
 
@@ -132,22 +146,28 @@ if [ -f "$STATE" ]; then
   STATE_HASH=$(cat "$STATE")
 fi
 
+progress "checking runner requirements"
 if [ "$REQ_HASH" != "$STATE_HASH" ]; then
+  progress "installing runner requirements"
   "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
   printf '%s' "$REQ_HASH" > "$STATE"
 fi
 
 if ! "$TUV_RUNNER_PYTHON" -c 'import packaging' >/dev/null 2>&1; then
+  progress "repairing runner requirements"
   "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
   printf '%s' "$REQ_HASH" > "$STATE"
 fi
 
+progress "checking system uv provider"
 if command -v uv >/dev/null 2>&1 && uv --version >/dev/null 2>&1; then
   TUV_SYSTEM_UV_EXE=$(command -v uv)
   export TUV_SYSTEM_UV_EXE
+  progress "system uv provider: $TUV_SYSTEM_UV_EXE"
 fi
 
 export TUV_NEWEST_PYTHON
 export TUV_RUNNER_VENV
 export TUV_RUNNER_PYTHON
+progress "entering terminal UI"
 exec "$TUV_RUNNER_PYTHON" "$APP" "$@"

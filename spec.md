@@ -46,22 +46,32 @@ The launchers are expected to be placed on `PATH`, but all file references are r
 
 Launcher responsibilities:
 
-1. Determine the launcher directory and use it as `TUV_HOME`.
-2. Locate `tuv.py` and `requirements.txt` in `TUV_HOME`.
-3. Parse launcher-only runner selection arguments before creating the runner venv. The literal dot argument `.` is consumed by the launcher and is not forwarded to `tuv.py`.
-4. If Tuv is started as `tuv .`, `tuv.sh .`, or `tuv.bat .`, explicitly select the current-working-directory Python as the runner Python.
-5. Without the dot argument, discover platform runner Python candidates first and select the newest usable platform interpreter; use a current-working-directory Python only as a fallback when no usable platform interpreter exists.
-6. After selecting the runner Python, find a compatible Tuv runner venv under `TUV_HOME`; if none exists, create a new script-relative runner venv with a hash suffix such as `TUV_HOME/tuv-venv-1a3b8e4f`.
-7. Verify that the selected runner venv Python exists and can execute the standard JSON probe. If it is missing, removed, broken, or points at a removed base interpreter, mark that runner venv incompatible and select or create another compatible runner venv.
-8. Record the interpreter used to build the runner venv. If a different runner Python is later selected, use a compatible runner venv for that interpreter instead of mutating an incompatible runner venv in place.
-9. Ensure the selected Tuv runner venv can be put into functional mode. Functional mode means runner Python works, `pip` works or can be restored with `ensurepip`, and `uv` works or can be installed through runner `pip`.
-10. Ensure `pip` in the selected Tuv runner venv. If `<tuv-venv-python> -m pip --version` fails, run `<tuv-venv-python> -m ensurepip --upgrade`, then check runner `pip` again.
-11. Ensure `uv` in the selected Tuv runner venv. If `<tuv-venv-python> -m uv --version` fails, install it with `<tuv-venv-python> -m pip install uv`, after ensuring runner pip.
-12. If runner `pip`, runner `uv`, and runner `ensurepip` are all unavailable or cannot make the runner venv functional, exit gracefully with an informative message instead of starting a broken TUI.
-13. Install `requirements.txt` into the selected runner venv using the runner venv Python.
-14. Detect whether a standalone system `uv` executable is available by running `uv --version`.
-15. Execute `TUV_HOME/tuv.py` with the selected runner venv Python.
-16. Forward remaining CLI arguments to `tuv.py`.
+1. Print an immediate concise startup line before any potentially slow discovery, venv, or dependency work.
+2. Determine the launcher directory and use it as `TUV_HOME`.
+3. Locate `tuv.py` and `requirements.txt` in `TUV_HOME`.
+4. Parse launcher-only runner selection arguments before creating the runner venv. The literal dot argument `.` is consumed by the launcher and is not forwarded to `tuv.py`.
+5. If Tuv is started as `tuv .`, `tuv.sh .`, or `tuv.bat .`, explicitly select the current-working-directory Python as the runner Python.
+6. Without the dot argument, discover platform runner Python candidates first and select the newest usable platform interpreter; use a current-working-directory Python only as a fallback when no usable platform interpreter exists.
+7. After selecting the runner Python, find a compatible Tuv runner venv under `TUV_HOME`; if none exists, create a new script-relative runner venv with a hash suffix such as `TUV_HOME/tuv-venv-1a3b8e4f`.
+8. Verify that the selected runner venv Python exists and can execute the standard JSON probe. If it is missing, removed, broken, or points at a removed base interpreter, mark that runner venv incompatible and select or create another compatible runner venv.
+9. Record the interpreter used to build the runner venv. If a different runner Python is later selected, use a compatible runner venv for that interpreter instead of mutating an incompatible runner venv in place.
+10. Ensure the selected Tuv runner venv can be put into functional mode. Functional mode means runner Python works, `pip` works or can be restored with `ensurepip`, and `uv` works or can be installed through runner `pip`.
+11. Ensure `pip` in the selected Tuv runner venv. If `<tuv-venv-python> -m pip --version` fails, run `<tuv-venv-python> -m ensurepip --upgrade`, then check runner `pip` again.
+12. Ensure `uv` in the selected Tuv runner venv. If `<tuv-venv-python> -m uv --version` fails, install it with `<tuv-venv-python> -m pip install uv`, after ensuring runner pip.
+13. If runner `pip`, runner `uv`, and runner `ensurepip` are all unavailable or cannot make the runner venv functional, exit gracefully with an informative message instead of starting a broken TUI.
+14. Install `requirements.txt` into the selected runner venv using the runner venv Python.
+15. Detect whether a standalone system `uv` executable is available by running `uv --version`.
+16. Execute `TUV_HOME/tuv.py` with the selected runner venv Python.
+17. Forward remaining CLI arguments to `tuv.py`.
+
+Startup shell feedback:
+
+- The launcher must write human progress lines to `stderr`, not `stdout`, so helper output and machine-readable preparation values remain separate.
+- The first progress line must be emitted immediately after launch argument parsing starts or completes, before runner Python discovery.
+- Progress lines should be short, stable, and prefixed consistently, for example `tuv: starting`, `tuv: discovering runner Python`, `tuv: preparing runner environment`, `tuv: ensuring runner pip`, `tuv: ensuring runner uv`, `tuv: checking runner requirements`, `tuv: checking system uv provider`, and `tuv: entering terminal UI`.
+- When a meaningful path is known, show it on a follow-up progress line, especially the selected runner Python and selected runner venv path.
+- The launcher should print extra lines only when slow repair work is actually performed, such as restoring runner `pip` with `ensurepip`, installing runner `uv`, or reinstalling `requirements.txt`.
+- These progress lines are launcher-time shell output only. Once `tuv.py` enters alternate-screen mode, normal TUI status rendering owns further feedback.
 
 The launcher should pass discovery anchors to `tuv.py` through environment variables:
 
@@ -414,6 +424,9 @@ Table:
 - Current packages are colored light green.
 - Outdated packages should be visually distinguishable from current packages.
 - Packages installed or updated during the current Tuv session are colored white.
+- During a package-table refresh, rows that temporarily return to `loading` while status and target-version data is being recomputed should retain their previous stable row color when the package still exists. This retained color is only a rendering hint; it must not make the row actionable or preserve stale status semantics.
+- Loading rows without a previous stable color should use a subdued neutral style rather than bright/default white.
+- White must not be used as a default or transient refresh color for unchanged rows. Only packages whose installed version changed or newly appeared during the current Tuv session should receive the white updated-session styling.
 - Failed installations are shown in bold red.
 
 Visual priority:
@@ -421,8 +434,9 @@ Visual priority:
 1. Focused row indication.
 2. Failed row: bold red.
 3. Installed or updated during current session: white.
-4. Current package: light green.
-5. Outdated package: outdated styling.
+4. Current package, or a loading row whose retained refresh color was current: light green.
+5. Outdated package, or a loading row whose retained refresh color was outdated: outdated styling.
+6. Loading row without a retained refresh color: subdued neutral styling.
 
 Bottom indicator:
 
@@ -503,7 +517,9 @@ Package metadata and dependency relationships:
 
 - Tuv should combine multiple available techniques to identify package dependencies and usage relationships instead of relying on a single fragile source.
 - Preferred sources include installed distribution metadata read through the selected context's interpreter, `importlib.metadata` fields such as `Requires-Dist` and summary, metadata files under installed `.dist-info` directories, and uv-provided inspection output when it is available.
-- Dependency evaluation should normalize package names, evaluate environment markers for the selected context where possible, and ignore extras that are not active unless the installed metadata makes the extra relationship explicit.
+- Dependency evaluation should normalize package names and evaluate non-extra environment markers for the selected context where possible.
+- Because standard installed distribution metadata does not reliably record which extras were requested when a package was installed, Tuv must be conservative for uninstall-safety. If an installed package declares a `Requires-Dist` dependency that applies for the current Python/platform environment under any declared `Provides-Extra`, and the dependency package is installed, treat that dependency as used by the declaring package.
+- Extra-gated dependencies that are incompatible with the current Python/platform environment must not be counted merely because the extra exists.
 - The information panel should use the package summary or description metadata when available, preferring a short one-line summary over long project descriptions.
 - Failed or untrusted metadata must be surfaced as unavailable metadata, not converted into empty dependency and usage relationships.
 
@@ -764,6 +780,7 @@ PackageRow
   candidate_versions: list of version strings
   status: current | ready | loading | wait | installing | skipped | done | failed
   updated_in_session: bool, true when installed or updated during current Tuv session
+  color_hint: optional current | outdated | updated rendering hint for loading rows during refresh
   last_error: string or null
   last_error_detail: string or null
   last_install_result: InstallResult or null
@@ -788,6 +805,7 @@ InstallResult
 ## Acceptance Criteria
 
 - Running `tuv.sh` on Linux/macOS or `tuv.bat` on Windows starts an alternate-screen TUI when Python is installed and the Tuv runner environment can be ensured.
+- The launcher prints an immediate `tuv:` startup line and concise bootstrap progress lines before the alternate-screen TUI starts.
 - The launcher uses script-relative paths for `tuv.py`, `requirements.txt`, and the runner venv.
 - New runner venvs are created directly under `TUV_HOME` with names like `tuv-venv-1a3b8e4f`; legacy `.tuv-venv` may be reused only when compatible.
 - The launcher discovers the newest usable platform Python interpreter for default launches.
@@ -855,10 +873,12 @@ InstallResult
 - The TUI remains responsive during installation.
 - After any completed installation, the full package table refreshes so dependency updates made by uv are reflected.
 - Packages installed or updated during the current Tuv session are colored white after refresh.
+- During the post-install refresh, unchanged rows do not briefly flash white while their refreshed status is still loading; they keep their previous stable color until fresh current/outdated status is known.
 - Current packages are colored light green unless a higher-priority row style applies.
 - Package rows show `* ` before the package name when that package can be uninstalled without breaking dependency requirements.
 - Package rows show `* ` only after trusted metadata matching the current displayed package table is available.
 - Dependency and usage relationships are derived from multiple available metadata sources and normalized for the selected context.
+- Optional-extra dependency metadata is interpreted conservatively for uninstall-safety so installed packages are not marked unused merely because the active extra cannot be proven from installed metadata.
 - Failures are visible, recoverable, and do not terminate the application.
 - Every modal overlay or dialog closes with `Esc` or `q`.
 
@@ -900,6 +920,7 @@ These examples describe behavior that must be treated as bugs and covered by reg
 - `q` key does not close any modal dialog or selector in the same way as `Esc`.
 - Pressing `q` with no modal open does not quit the main application.
 - Pressing `F10` with no modal open does not quit the main application.
+- The launcher appears silent for several seconds before the alternate-screen TUI starts.
 - Large information dialog content is not scrollable as expected.
 - In the version selector, moving selection down scrolls the entire content upward while the selection marker stays at the top; the marker should move down until it reaches the visible selector boundary.
 - A modal dialog title is rendered as a separate first body line instead of being embedded into the top-left border.
@@ -931,5 +952,6 @@ These examples describe behavior that must be treated as bugs and covered by reg
 - `Left` or `Right` only toggles between installed and latest instead of traversing all index-enumerated installable versions.
 - `F3` omits failure exit code, stdout/stderr tails, elapsed time, short description, or dependency/usage relationships required by the information panel.
 - Dependency metadata collection fails, but all packages are marked with `* ` as though metadata proved they are uninstall-safe.
+- A package required only through a standard `Requires-Dist: <name>; extra == ...` relationship is marked uninstall-safe while the declaring package and dependency are both installed.
 - Version lookup silently falls back to a different public package index when the selected context has an explicit configured index that failed.
 - Dead helper functions or stale state fields remain after behavior is replaced, causing future changes to target inactive code paths.
