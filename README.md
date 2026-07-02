@@ -16,10 +16,12 @@ Package information dialog:
 
 - Native terminal UI in one Python file, with no TUI framework dependency.
 - `uv` backend invoked as `python -m uv`; no bare `uv` executable is required on `PATH`.
-- Context selector for the Tuv runner venv, active venvs, local venvs, and discovered interpreters.
-- Alphabetical package table with installed version, target version, and install status.
-- Async installs with a responsive UI and sequential update-all behavior.
-- Package info panel with dependency and usage-package lists.
+- Context selector for the Tuv runner venv, active venvs, local venvs, and discovered interpreters, with venv creation and rescan built in.
+- Alphabetical package table with installed version, target version, and status, plus a live status line for progress and errors.
+- Async installs and uninstalls with a responsive UI, a wait queue, and cancellable sequential update-all with a summary report.
+- Incremental filtering, multi-select, per-context pins that exclude packages from update-all, and new-package installs.
+- Package info panel with description, dependency, and usage-package lists.
+- Yanked releases are marked in the version selector and require an extra confirmation.
 
 ## Run
 
@@ -67,14 +69,22 @@ The launcher discovers a usable Python, creates or reuses a script-relative runn
 | --- | --- |
 | Up / Down | Move package selection |
 | PageUp / PageDown | Jump through rows |
-| Left / Right | Select older or newer target version |
-| Enter | Install selected target version |
-| F2 | Update all ready packages after confirmation |
+| Left / Right | Select older or newer target version (fetches the full version list on first use) |
+| Enter | Install selected target version (queues if an install is running) |
+| Space | Toggle package selection for a selective update-all |
+| / | Filter the package table incrementally (Enter keeps the filter, Esc clears it) |
+| i | Install a new package by name |
+| Delete | Uninstall the focused package after a safety preview |
+| p | Pin or unpin the focused package (pinned packages are excluded from update-all) |
+| F2 | Update all ready packages (or the selected/filtered subset) after a preview confirmation |
 | F3 | Show package information |
 | F4 | Open version selector |
-| F9 | Open context selector |
-| Esc / q | Close dialogs and selectors |
-| F10 / q | Quit from the main screen |
+| F5 | Rescan Python contexts without restarting |
+| F9 | Open context selector (`n` inside creates a venv in the current directory) |
+| Esc | Close dialogs; on the main screen: clear selection, then filter, then cancel a running operation |
+| F10 / q | Quit from the main screen (asks before abandoning a running install) |
+
+Row markers: `*` before a name means no other installed package requires it (safe to uninstall); `+` marks packages selected with Space. Pinned packages show `pinned` in the Action column.
 
 ## Project Files
 

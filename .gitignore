@@ -152,6 +152,7 @@ activemq-data/
 .envrc
 .venv
 tuv-venv-*/
+.tuv-runner.lock
 env/
 venv/
 ENV/

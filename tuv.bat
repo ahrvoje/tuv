@@ -32,6 +32,16 @@ if not exist "%REQ%" (
   exit /b 1
 )
 
+rem Quick probe: any working Python can bootstrap; --prepare-runner re-selects
+rem the best interpreter itself, so the expensive scan below is fallback only.
+1>&2 echo(tuv: discovering runner Python
+set "BOOTSTRAP_PYTHON="
+call :probe_python py -3
+if not defined BOOTSTRAP_PYTHON call :probe_python python
+if not defined BOOTSTRAP_PYTHON call :probe_python python3
+if defined BOOTSTRAP_PYTHON goto have_bootstrap_python
+
+1>&2 echo(tuv: quick probe found no Python, scanning the system
 for /f "delims=" %%T in ('powershell -NoProfile -Command "[IO.Path]::Combine($env:TEMP, 'tuv-bootstrap-' + [IO.Path]::GetRandomFileName() + '.ps1')"') do set "FIND_PS=%%T"
 > "%FIND_PS%" echo $ErrorActionPreference = 'SilentlyContinue'
 >> "%FIND_PS%" echo $c = @()
@@ -46,17 +56,16 @@ for /f "delims=" %%T in ('powershell -NoProfile -Command "[IO.Path]::Combine($en
 >> "%FIND_PS%" echo foreach ($p in ($c ^| Where-Object { $_ } ^| Select-Object -Unique)) { if (Test-Path $p) { $out = ^& $p -c "import sys; print(str(sys.version_info[0]) + ' ' + str(sys.version_info[1]) + ' ' + str(sys.version_info[2]) + ' ' + sys.executable)" 2^>^&1 ^| Out-String; if ($LASTEXITCODE -eq 0 -and $out -match '^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+?)\s*$') { $infos += [pscustomobject]@{Major=[int]$Matches[1]; Minor=[int]$Matches[2]; Patch=[int]$Matches[3]; Path=(Resolve-Path $Matches[4]).Path} } } }
 >> "%FIND_PS%" echo $infos ^| Sort-Object Major, Minor, Patch -Descending ^| Select-Object -First 1 -ExpandProperty Path
 
-1>&2 echo(tuv: discovering runner Python
 for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%FIND_PS%"`) do set "BOOTSTRAP_PYTHON=%%P"
 del "%FIND_PS%" >nul 2>nul
 
+:have_bootstrap_python
 if not defined BOOTSTRAP_PYTHON (
   echo No usable Python interpreter was found. 1>&2
   exit /b 1
 )
 1>&2 echo(tuv: runner Python: %BOOTSTRAP_PYTHON%
 
-set "TUV_HOME=%TUV_HOME%"
 for /f "delims=" %%T in ('powershell -NoProfile -Command "[IO.Path]::Combine($env:TEMP, 'tuv-runner-' + [IO.Path]::GetRandomFileName() + '.txt')"') do set "PREP_OUT=%%T"
 1>&2 echo(tuv: preparing runner environment
 "%BOOTSTRAP_PYTHON%" "%APP%" --prepare-runner --launcher-mode "%LAUNCHER_MODE%" > "%PREP_OUT%"
@@ -160,3 +169,8 @@ echo Tuv runner bootstrap failed: %BOOTSTRAP_STEP% 1>&2
 echo Runner Python: %TUV_RUNNER_PYTHON% 1>&2
 echo Runner venv: %TUV_RUNNER_VENV% 1>&2
 exit /b 1
+
+:probe_python
+for /f "delims=" %%P in ('%* -c "import sys;print(sys.executable)" 2^>nul') do set "BOOTSTRAP_PYTHON=%%P"
+if defined BOOTSTRAP_PYTHON if not exist "%BOOTSTRAP_PYTHON%" set "BOOTSTRAP_PYTHON="
+exit /b 0

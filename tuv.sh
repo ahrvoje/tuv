@@ -89,8 +89,22 @@ $path"
   printf '%s' "$newest"
 }
 
+# Quick probe: any working Python can bootstrap; --prepare-runner re-selects
+# the best interpreter itself, so the full scan is fallback only.
 progress "discovering runner Python"
-BOOTSTRAP_PYTHON=$(find_bootstrap_python)
+BOOTSTRAP_PYTHON=""
+for name in python3 python; do
+  path=$(command -v "$name" 2>/dev/null || true)
+  [ -n "$path" ] || continue
+  if exe=$("$path" -c 'import sys; print(sys.executable)' 2>/dev/null) && [ -n "$exe" ] && [ -x "$exe" ]; then
+    BOOTSTRAP_PYTHON="$exe"
+    break
+  fi
+done
+if [ -z "$BOOTSTRAP_PYTHON" ]; then
+  progress "quick probe found no Python, scanning the system"
+  BOOTSTRAP_PYTHON=$(find_bootstrap_python)
+fi
 if [ -z "$BOOTSTRAP_PYTHON" ]; then
   echo "No usable Python interpreter was found." >&2
   exit 1
