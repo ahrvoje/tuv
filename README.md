@@ -21,7 +21,12 @@ Package information dialog:
 - Async installs and uninstalls with a responsive UI, a wait queue, and cancellable sequential update-all with a summary report.
 - Incremental filtering, multi-select, per-context pins that exclude packages from update-all, and new-package installs.
 - Package info panel with description, dependency, and usage-package lists.
+- Automatic environment compatibility checks with a persistent health badge and an `F6` detail report.
+- Dependency and reverse-dependency tree views in the `F3` panel, recursively built from the same trusted installed metadata as the package details view.
 - Yanked releases are marked in the version selector and require an extra confirmation.
+- Version selection follows uv's effective indexes, source pins, index strategy, credentials, and target-Python constraints; every selected target is verified by an authoritative `uv --dry-run` before mutation.
+- Fast startup loads the probable default context first, repeated interpreter/provider probes are shared, bulk updates defer expensive metadata work between items, and rendering writes only changed terminal rows.
+- Cancellation terminates the complete package-operation process tree, pin updates are concurrent and atomic, and untrusted package/tool output is terminal-sanitized with cell-correct Unicode layout.
 
 ## Run
 
@@ -73,15 +78,17 @@ The launcher discovers a usable Python, creates or reuses a script-relative runn
 | Enter | Install selected target version (queues if an install is running) |
 | Space | Toggle package selection for a selective update-all |
 | / | Filter the package table incrementally (Enter keeps the filter, Esc clears it) |
-| i | Install a new package by name |
+| i | Show package information (same as F3) |
+| n | Install a new package by name |
 | Delete | Uninstall the focused package after a safety preview |
 | p | Pin or unpin the focused package (pinned packages are excluded from update-all) |
 | F2 | Update all ready packages (or the selected/filtered subset) after a preview confirmation |
-| F3 | Show package information |
+| F3 | Show package information; use Left/Right or 1/2/3 for details, dependency tree, and reverse-dependency tree |
 | F4 | Open version selector |
 | F5 | Rescan Python contexts without restarting |
+| F6 | Show the latest environment health report |
 | F9 | Open context selector (`n` inside creates a venv in the current directory) |
-| Esc | Close dialogs; on the main screen: clear selection, then filter, then cancel a running operation |
+| Esc / q | Close the active non-text dialog; in a text field q remains text and Esc closes it; on the main screen Esc clears selection/filter or cancels, while q quits |
 | F10 / q | Quit from the main screen (asks before abandoning a running install) |
 
 Row markers: `*` before a name means no other installed package requires it (safe to uninstall); `+` marks packages selected with Space. Pinned packages show `pinned` in the Action column.

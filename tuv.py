@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import hashlib
 import json
+import netrc
 import os
 import platform
 import queue
@@ -19,12 +21,18 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable
+
+try:
+    from wcwidth import wcwidth as _wcwidth
+except Exception:  # pragma: no cover - bootstrap runs before runner requirements are installed.
+    _wcwidth = None
 
 try:
     import tomllib
@@ -32,7 +40,7 @@ except Exception:  # pragma: no cover - Python < 3.11 falls back to regex scanni
     tomllib = None  # type: ignore
 
 try:
-    from packaging.markers import default_environment
+    from packaging.markers import Marker, default_environment
     from packaging.requirements import InvalidRequirement, Requirement
     from packaging.utils import (
         InvalidSdistFilename,
@@ -42,6 +50,7 @@ try:
         parse_wheel_filename,
     )
     from packaging.version import InvalidVersion, Version
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
 except Exception:  # pragma: no cover - runner requirements should provide packaging.
     canonicalize_name = lambda value: re.sub(r"[-_.]+", "-", value).lower()  # type: ignore
     Requirement = None  # type: ignore
@@ -51,8 +60,11 @@ except Exception:  # pragma: no cover - runner requirements should provide packa
     parse_sdist_filename = None  # type: ignore
     parse_wheel_filename = None  # type: ignore
     default_environment = None  # type: ignore
+    Marker = None  # type: ignore
     Version = None  # type: ignore
     InvalidVersion = Exception  # type: ignore
+    SpecifierSet = None  # type: ignore
+    InvalidSpecifier = Exception  # type: ignore
 
 
 IS_WINDOWS = os.name == "nt"
@@ -218,6 +230,22 @@ class PackageMetadata:
     extras: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class IndexEntry:
+    name: str | None
+    url: str
+    explicit: bool = False
+    default: bool = False
+    authenticate: str = "auto"
+    ignore_error_codes: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class EffectiveIndexConfig:
+    entries: tuple[IndexEntry, ...]
+    strategy: str = "first-index"
+
+
 def version_key(value: str) -> tuple[int, object]:
     if Version is not None:
         try:
@@ -260,30 +288,86 @@ def run_command(args: list[str], timeout: float | None = None) -> subprocess.Com
     )
 
 
+def terminate_process_tree(proc: subprocess.Popen[str], grace: float = 0.5) -> None:
+    if proc.poll() is not None:
+        return
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(1.0, grace + 0.5),
+                shell=False,
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except Exception:
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def uv_version_text(output: str) -> str:
     first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
     return first_line or "unknown"
 
 
 _UV_VALIDATION_CACHE: dict[tuple[str, ...], str] = {}
+_UV_VALIDATION_INFLIGHT: dict[tuple[str, ...], threading.Event] = {}
 _UV_VALIDATION_LOCK = threading.Lock()
 
 
 def validate_uv_command(command: list[str], timeout: float = 5.0) -> str | None:
     key = tuple(command)
     with _UV_VALIDATION_LOCK:
-        cached = _UV_VALIDATION_CACHE.get(key)
-    if cached is not None:
-        return cached
+        if key in _UV_VALIDATION_CACHE:
+            return _UV_VALIDATION_CACHE[key]
+        inflight = _UV_VALIDATION_INFLIGHT.get(key)
+        if inflight is None:
+            inflight = threading.Event()
+            _UV_VALIDATION_INFLIGHT[key] = inflight
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        inflight.wait(timeout + 1.0)
+        with _UV_VALIDATION_LOCK:
+            return _UV_VALIDATION_CACHE.get(key)
+    version: str | None = None
     try:
         proc = run_command([*command, "--version"], timeout=timeout)
     except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    version = uv_version_text(proc.stdout or proc.stderr)
-    with _UV_VALIDATION_LOCK:
-        _UV_VALIDATION_CACHE[key] = version
+        pass
+    else:
+        if proc.returncode == 0:
+            version = uv_version_text(proc.stdout or proc.stderr)
+    finally:
+        with _UV_VALIDATION_LOCK:
+            if version is not None:
+                _UV_VALIDATION_CACHE[key] = version
+            event = _UV_VALIDATION_INFLIGHT.pop(key, None)
+            if event is not None:
+                event.set()
     return version
 
 
@@ -399,7 +483,11 @@ def provider_label(provider: UvProvider | None) -> str:
 def resolve_uv_provider(context: PythonContext) -> UvProvider | None:
     checked_python: set[str] = set()
 
-    if context.is_virtual and context.type != "tuv":
+    if context.type == "tuv":
+        provider = runner_uv_provider(priority=1)
+        if provider is not None:
+            return provider
+    elif context.is_virtual:
         checked_python.add(path_key(context.python_path))
         provider = python_uv_provider("context_venv", context.python_path, 1)
         if provider is not None:
@@ -441,7 +529,16 @@ def uv_command(context: PythonContext, args: list[str]) -> list[str]:
     return [*provider.command_prefix, *args]
 
 
-def probe_python(executable: str | Path, timeout: float = 3.0, source: str = "installed") -> PythonInfo | None:
+_PYTHON_PROBE_CACHE: dict[str, PythonInfo] = {}
+_PYTHON_PROBE_INFLIGHT: dict[str, threading.Event] = {}
+_PYTHON_PROBE_LOCK = threading.Lock()
+
+
+def _probe_python_uncached(
+    executable: str | Path,
+    timeout: float = 3.0,
+    source: str = "installed",
+) -> PythonInfo | None:
     path = Path(str(executable).strip().strip('"'))
     if not path:
         return None
@@ -484,6 +581,41 @@ def probe_python(executable: str | Path, timeout: float = 3.0, source: str = "in
         )
     except Exception:
         return None
+
+
+def probe_python(executable: str | Path, timeout: float = 3.0, source: str = "installed") -> PythonInfo | None:
+    raw = str(executable).strip().strip('"')
+    resolved = shutil.which(raw) or raw
+    try:
+        key = os.path.normcase(str(Path(resolved).resolve()))
+    except Exception:
+        key = os.path.normcase(resolved)
+    with _PYTHON_PROBE_LOCK:
+        cached = _PYTHON_PROBE_CACHE.get(key)
+        if cached is not None:
+            return replace(cached, source=source)
+        inflight = _PYTHON_PROBE_INFLIGHT.get(key)
+        owner = inflight is None
+        if owner:
+            inflight = threading.Event()
+            _PYTHON_PROBE_INFLIGHT[key] = inflight
+    if not owner:
+        assert inflight is not None
+        inflight.wait(timeout + 1.0)
+        with _PYTHON_PROBE_LOCK:
+            cached = _PYTHON_PROBE_CACHE.get(key)
+        return replace(cached, source=source) if cached is not None else None
+    try:
+        result = _probe_python_uncached(resolved, timeout=timeout, source=source)
+        if result is not None:
+            with _PYTHON_PROBE_LOCK:
+                _PYTHON_PROBE_CACHE[key] = replace(result, source="installed")
+        return result
+    finally:
+        with _PYTHON_PROBE_LOCK:
+            event = _PYTHON_PROBE_INFLIGHT.pop(key, None)
+            if event is not None:
+                event.set()
 
 
 def probe_runner_python(executable: str | Path, timeout: float = 5.0, source: str = "installed") -> PythonInfo | None:
@@ -736,8 +868,22 @@ def select_runner_python(mode: str) -> PythonInfo:
             raise RuntimeError(f"No usable current-working-directory Python was found in {cwd}")
         return infos[0]
 
+    # Probe the bootstrap interpreter once, then omit that executable from the
+    # platform scan. The remaining candidates are still compared so the
+    # documented newest-platform-Python selection rule remains intact.
+    preferred = probe_runner_python(sys.executable, source="installed")
     platform_candidates = windows_python_candidates() if IS_WINDOWS else posix_python_candidates()
+    if preferred is not None:
+        preferred_key = path_key(preferred.executable)
+        platform_candidates = [
+            candidate
+            for candidate in platform_candidates
+            if path_key(candidate) != preferred_key
+        ]
     platform_infos = sorted_runner_infos(platform_candidates, "installed")
+    if preferred is not None and not python_info_is_venv(preferred):
+        platform_infos.append(preferred)
+        platform_infos.sort(key=lambda item: item.version, reverse=True)
     if platform_infos:
         return platform_infos[0]
 
@@ -1084,7 +1230,16 @@ def discover_contexts() -> list[PythonContext]:
         children = []
     for child in children:
         try:
-            if child.resolve() == RUNNER_VENV:
+            resolved_child = child.resolve()
+            is_managed_runner = (
+                resolved_child == RUNNER_VENV
+                or (
+                    resolved_child.parent == TUV_HOME
+                    and (resolved_child / ".tuv-runner-state").is_file()
+                    and (resolved_child.name.startswith("tuv-venv-") or resolved_child.name == ".tuv-venv")
+                )
+            )
+            if is_managed_runner:
                 continue
         except OSError:
             continue
@@ -1105,6 +1260,70 @@ def discover_contexts() -> list[PythonContext]:
     if unresolved:
         with ThreadPoolExecutor(max_workers=min(8, len(unresolved))) as pool:
             list(pool.map(refresh_context_uv_provider, unresolved))
+    return contexts
+
+
+def discover_priority_contexts() -> list[PythonContext]:
+    """Discover only contexts that can plausibly be selected by default."""
+    contexts: list[PythonContext] = []
+    seen: set[str] = set()
+
+    def add(context: PythonContext | None) -> None:
+        if context is None or context.id in seen:
+            return
+        seen.add(context.id)
+        contexts.append(context)
+
+    active = os.environ.get("VIRTUAL_ENV")
+    if active:
+        add(context_from_venv("venv", Path(active), "active venv", "active"))
+    cwd = Path.cwd()
+    if is_venv(cwd):
+        add(context_from_venv("venv", cwd, cwd.name or str(cwd), "cwd"))
+    project_venv = cwd / ".venv"
+    if project_venv != RUNNER_VENV and is_venv(project_venv):
+        add(context_from_venv("venv", project_venv, ".venv", "scanned"))
+    for info in sorted_runner_infos(cwd_python_candidates(cwd, allow_venv=False), "cwd"):
+        add(
+            PythonContext(
+                id=stable_context_id("interpreter", info.executable),
+                type="interpreter",
+                source="cwd",
+                label=f"cwd interpreter - Python {info.version_text} - {info.executable}",
+                python_path=info.executable,
+                reference_python_path=info.executable,
+                root_path=None,
+                version=info.version_text,
+            )
+        )
+    for candidate in launcher_python_candidates():
+        info = probe_python(candidate, source="installed")
+        if info is None or python_info_is_venv(info):
+            continue
+        add(
+            PythonContext(
+                id=stable_context_id("interpreter", info.executable),
+                type="interpreter",
+                source="installed",
+                label=f"interpreter - Python {info.version_text} - {info.executable}",
+                python_path=info.executable,
+                reference_python_path=info.executable,
+                root_path=None,
+                version=info.version_text,
+            )
+        )
+    add(context_from_venv("tuv", RUNNER_VENV, "tuv venv", "tuv"))
+    if contexts:
+        preferred = next(
+            (
+                context
+                for context in contexts
+                if (context.type == "venv" and context.source == "active")
+                or (context.type == "venv" and context.root_path is not None and context.root_path.name == ".venv")
+            ),
+            contexts[0],
+        )
+        refresh_context_uv_provider(preferred)
     return contexts
 
 
@@ -1339,105 +1558,351 @@ def short_description(value: object) -> str | None:
 class SimpleRepositoryLinkParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.links: list[tuple[str, bool]] = []
+        self.links: list[tuple[str, bool, str | None]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag.lower() != "a":
             return
         href: str | None = None
         yanked = False
+        requires_python: str | None = None
         for name, value in attrs:
             lowered = name.lower()
             if lowered == "href" and value:
                 href = value
             elif lowered == "data-yanked":
                 yanked = True
+            elif lowered == "data-requires-python" and value:
+                requires_python = value
         if href:
-            self.links.append((href, yanked))
+            self.links.append((href, yanked, requires_python))
 
 
-def configured_index_urls() -> list[str]:
-    urls: list[str] = []
-
-    def add(value: str | None) -> None:
-        if not value:
-            return
-        for part in re.split(r"\s+", value.strip()):
-            if part and part not in urls:
-                urls.append(part)
-
-    primary = os.environ.get("UV_INDEX_URL") or os.environ.get("UV_DEFAULT_INDEX") or os.environ.get("PIP_INDEX_URL")
-    if primary:
-        add(primary)
-    else:
-        local = discover_local_index_url()
-        add(local or "https://pypi.org/simple/")
-    add(os.environ.get("UV_EXTRA_INDEX_URL") or os.environ.get("PIP_EXTRA_INDEX_URL"))
-    return urls
+def environment_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def index_url_from_uv_table(table: object) -> str | None:
-    if not isinstance(table, dict):
-        return None
-    indexes = table.get("index")
-    if isinstance(indexes, list):
-        for entry in indexes:
-            if isinstance(entry, dict) and entry.get("default") is True:
-                url = entry.get("url")
-                if isinstance(url, str) and url.strip():
-                    return url.strip()
-    for key in ("default-index", "index-url"):
-        value = table.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
-
-
-def index_url_from_config_file(path: Path) -> str | None:
-    if tomllib is not None:
-        try:
-            with open(path, "rb") as handle:
-                data = tomllib.load(handle)
-        except Exception:
-            return None
-        if path.name == "uv.toml":
-            return index_url_from_uv_table(data)
-        tool = data.get("tool")
-        return index_url_from_uv_table(tool.get("uv")) if isinstance(tool, dict) else None
-    # Regex fallback (Python < 3.11): only uv.toml is scanned; a bare `url =`
-    # in pyproject.toml usually belongs to unrelated tables such as project.urls.
-    if path.name != "uv.toml":
-        return None
+def read_uv_config_table(path: Path) -> dict[str, object]:
+    if tomllib is None:
+        raise RuntimeError(f"Cannot parse uv configuration on this Python version: {path}")
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    for key in ("default-index", "index-url"):
-        match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*['\"]([^'\"]+)['\"]", text)
-        if match:
-            return match.group(1)
-    return None
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except Exception as exc:
+        raise RuntimeError(f"Could not parse uv configuration {path}: {exc}") from exc
+    if path.name == "pyproject.toml":
+        tool = data.get("tool") if isinstance(data, dict) else None
+        table = tool.get("uv") if isinstance(tool, dict) else None
+        return dict(table) if isinstance(table, dict) else {}
+    return dict(data) if isinstance(data, dict) else {}
 
 
-def discover_local_index_url() -> str | None:
+def discover_project_uv_config() -> tuple[Path, dict[str, object]] | None:
     for directory in [Path.cwd(), *Path.cwd().parents]:
-        for filename in ("uv.toml", "pyproject.toml"):
-            path = directory / filename
-            if not path.is_file():
-                continue
-            url = index_url_from_config_file(path)
-            if url:
-                return url
-        # Stop at the repository root; configs above it belong to other projects.
-        if (directory / ".git").exists():
-            break
+        uv_path = directory / "uv.toml"
+        pyproject_path = directory / "pyproject.toml"
+        if uv_path.is_file():
+            return uv_path, read_uv_config_table(uv_path)
+        if pyproject_path.is_file():
+            table = read_uv_config_table(pyproject_path)
+            if table:
+                return pyproject_path, table
     return None
+
+
+def user_uv_config_path() -> Path:
+    if IS_WINDOWS:
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "uv" / "uv.toml"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "uv" / "uv.toml"
+
+
+def system_uv_config_paths() -> list[Path]:
+    if IS_WINDOWS:
+        base = os.environ.get("PROGRAMDATA")
+        return [Path(base) / "uv" / "uv.toml"] if base else []
+    xdg_dirs = [Path(value) for value in os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(os.pathsep) if value]
+    return [*(path / "uv" / "uv.toml" for path in xdg_dirs), Path("/etc/uv/uv.toml")]
+
+
+def uv_config_tables() -> list[tuple[Path, dict[str, object]]]:
+    if environment_flag("UV_NO_CONFIG"):
+        return []
+    explicit = os.environ.get("UV_CONFIG_FILE")
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise RuntimeError(f"UV_CONFIG_FILE does not exist: {path}")
+        return [(path, read_uv_config_table(path))]
+    tables: list[tuple[Path, dict[str, object]]] = []
+    project = discover_project_uv_config()
+    if project is not None:
+        tables.append(project)
+    user = user_uv_config_path()
+    if user.is_file():
+        tables.append((user, read_uv_config_table(user)))
+    for system in system_uv_config_paths():
+        if system.is_file():
+            tables.append((system, read_uv_config_table(system)))
+            break
+    return tables
+
+
+def index_entry_from_value(value: object) -> IndexEntry | None:
+    if not isinstance(value, dict):
+        return None
+    url = value.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    raw_codes = value.get("ignore-error-codes", [])
+    codes = tuple(int(code) for code in raw_codes if str(code).isdigit()) if isinstance(raw_codes, list) else ()
+    return IndexEntry(
+        name=str(value.get("name")).strip() if value.get("name") else None,
+        url=url.strip(),
+        explicit=value.get("explicit") is True,
+        default=value.get("default") is True,
+        authenticate=str(value.get("authenticate", "auto")),
+        ignore_error_codes=codes,
+    )
+
+
+def split_index_values(value: str | None) -> list[IndexEntry]:
+    entries: list[IndexEntry] = []
+    for part in re.split(r"\s+", (value or "").strip()):
+        if not part:
+            continue
+        name: str | None = None
+        url = part
+        prefix, separator, remainder = part.partition("=")
+        if separator and re.fullmatch(r"[A-Za-z0-9._-]+", prefix) and "://" in remainder:
+            name, url = prefix, remainder
+        entries.append(IndexEntry(name, url))
+    return entries
+
+
+def index_entries_from_setting(value: object) -> list[IndexEntry]:
+    if isinstance(value, str):
+        return split_index_values(value)
+    if isinstance(value, list):
+        entries: list[IndexEntry] = []
+        for item in value:
+            if isinstance(item, str):
+                entries.extend(split_index_values(item))
+        return entries
+    return []
+
+
+def effective_table_setting(
+    tables: list[tuple[Path, dict[str, object]]],
+    key: str,
+    include_pip: bool = True,
+) -> object | None:
+    if include_pip:
+        for _path, table in tables:
+            pip_table = table.get("pip")
+            if isinstance(pip_table, dict) and key in pip_table:
+                return pip_table[key]
+    for _path, table in tables:
+        if key in table:
+            return table[key]
+    return None
+
+
+def marker_matches_context(marker_text: str, context: PythonContext) -> bool:
+    if Marker is None:
+        return False
+    environment = dict(default_environment() if default_environment is not None else {})
+    environment["python_full_version"] = context.version
+    environment["python_version"] = ".".join(context.version.split(".")[:2])
+    try:
+        return bool(Marker(marker_text).evaluate(environment=environment))
+    except Exception:
+        return False
+
+
+def source_index_name(source: object, context: PythonContext) -> str | None:
+    candidates = source if isinstance(source, list) else [source]
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("index"), str):
+            continue
+        marker = candidate.get("marker")
+        if marker is None or (isinstance(marker, str) and marker_matches_context(marker, context)):
+            return str(candidate["index"])
+    return None
+
+
+def effective_index_config(package_name: str, context: PythonContext) -> EffectiveIndexConfig:
+    if environment_flag("UV_NO_INDEX") or environment_flag("PIP_NO_INDEX"):
+        raise RuntimeError("uv index access is disabled by UV_NO_INDEX")
+    if os.environ.get("UV_FIND_LINKS") or os.environ.get("PIP_FIND_LINKS"):
+        raise RuntimeError("Full version selection is unavailable when UV_FIND_LINKS is configured")
+    tables = uv_config_tables()
+    configured_no_index = effective_table_setting(tables, "no-index")
+    if configured_no_index is True:
+        raise RuntimeError("uv index access is disabled by configuration")
+    configured_find_links = effective_table_setting(tables, "find-links")
+    if configured_find_links is not None and configured_find_links is not False and configured_find_links != "":
+        raise RuntimeError("Full version selection is unavailable with uv find-links configuration")
+    exclude_newer = effective_table_setting(tables, "exclude-newer", include_pip=False)
+    if exclude_newer is not None and exclude_newer is not False:
+        raise RuntimeError("Full version selection is unavailable with uv exclude-newer configuration")
+
+    configured: list[IndexEntry] = []
+    configured.extend(split_index_values(os.environ.get("UV_INDEX")))
+    configured.extend(split_index_values(os.environ.get("UV_EXTRA_INDEX_URL") or os.environ.get("PIP_EXTRA_INDEX_URL")))
+    for _path, table in tables:
+        raw_indexes = table.get("index", [])
+        if isinstance(raw_indexes, list):
+            configured.extend(entry for item in raw_indexes if (entry := index_entry_from_value(item)) is not None)
+        pip_table = table.get("pip")
+        if isinstance(pip_table, dict):
+            configured.extend(index_entries_from_setting(pip_table.get("extra-index-url")))
+
+    project_table = tables[0][1] if tables and tables[0][0].name == "pyproject.toml" else {}
+    raw_project_indexes = project_table.get("index", []) if isinstance(project_table, dict) else []
+    project_indexes = (
+        [entry for item in raw_project_indexes if (entry := index_entry_from_value(item)) is not None]
+        if isinstance(raw_project_indexes, list)
+        else []
+    )
+    sources = project_table.get("sources") if isinstance(project_table, dict) else None
+    source = None
+    if isinstance(sources, dict):
+        normalized_package = canonicalize_name(package_name)
+        source = next(
+            (value for name, value in sources.items() if canonicalize_name(str(name)) == normalized_package),
+            None,
+        )
+    pinned_index = source_index_name(source, context) if source is not None else None
+    if source is not None and pinned_index is None:
+        raise RuntimeError(f"{package_name} uses a non-index or unsupported marker-based uv source")
+
+    default_url = os.environ.get("UV_DEFAULT_INDEX") or os.environ.get("UV_INDEX_URL") or os.environ.get("PIP_INDEX_URL")
+    default_entry = next((entry for entry in configured if entry.default), None)
+    if default_url:
+        default_entry = IndexEntry(None, default_url, default=True)
+    if default_entry is None:
+        pip_index_url = None
+        for _path, table in tables:
+            pip_table = table.get("pip")
+            if isinstance(pip_table, dict) and isinstance(pip_table.get("index-url"), str):
+                pip_index_url = pip_table["index-url"]
+                break
+        candidate = (
+            pip_index_url
+            or effective_table_setting(tables, "default-index", include_pip=False)
+            or effective_table_setting(tables, "index-url", include_pip=False)
+        )
+        if isinstance(candidate, str) and candidate.strip():
+            default_entry = IndexEntry(None, candidate.strip(), default=True)
+    if default_entry is None and not any(entry.default for entry in configured):
+        default_entry = IndexEntry("pypi", "https://pypi.org/simple/", default=True)
+
+    if pinned_index is not None:
+        # uv source mappings may reference only indexes declared in the same
+        # project pyproject.toml, never a same-named environment/user index.
+        pinned = next((entry for entry in project_indexes if entry.name == pinned_index), None)
+        if pinned is None:
+            raise RuntimeError(f"Package source references unknown uv index: {pinned_index}")
+        entries = [pinned]
+    else:
+        entries = [entry for entry in configured if not entry.default and not entry.explicit]
+        if default_entry is not None and not default_entry.explicit:
+            entries.append(default_entry)
+    deduped: list[IndexEntry] = []
+    seen: set[str] = set()
+    for entry in entries:
+        key = redact_url(entry.url)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(entry)
+    if not deduped:
+        raise RuntimeError(f"No configured uv index is eligible for {package_name}")
+
+    strategy = os.environ.get("UV_INDEX_STRATEGY")
+    if not strategy:
+        candidate = effective_table_setting(tables, "index-strategy")
+        if isinstance(candidate, str):
+            strategy = candidate
+    strategy = strategy or "first-index"
+    if strategy not in {"first-index", "unsafe-first-match", "unsafe-best-match"}:
+        raise RuntimeError(f"Unsupported uv index strategy: {strategy}")
+    return EffectiveIndexConfig(tuple(deduped), strategy)
 
 
 def simple_project_url(index_url: str, package_name: str) -> str:
     base = index_url.rstrip("/") + "/"
     quoted = urllib.parse.quote(canonicalize_name(package_name), safe="")
     return urllib.parse.urljoin(base, f"{quoted}/")
+
+
+def redact_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ""
+    if parsed.port:
+        host += f":{parsed.port}"
+    # Query strings commonly carry signed-index tokens; they are not safe
+    # diagnostic or cache-key material.
+    return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
+_INDEX_AUTH_CACHE: dict[tuple[str, str | None], str | None] = {}
+_INDEX_AUTH_LOCK = threading.Lock()
+
+
+def index_authorization(
+    entry: IndexEntry,
+    context: PythonContext,
+    search_uv_store: bool = False,
+) -> tuple[str, str | None]:
+    parsed = urllib.parse.urlsplit(entry.url)
+    host = parsed.hostname or ""
+    netloc = host + (f":{parsed.port}" if parsed.port else "")
+    clean_url = urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    username = urllib.parse.unquote(parsed.username or "") or None
+    password = urllib.parse.unquote(parsed.password or "") or None
+    env_prefix = re.sub(r"[^A-Za-z0-9]", "_", (entry.name or "").upper())
+    if env_prefix:
+        username = os.environ.get(f"UV_INDEX_{env_prefix}_USERNAME") or username
+        password = os.environ.get(f"UV_INDEX_{env_prefix}_PASSWORD") or password
+    if entry.authenticate == "never":
+        if username or password:
+            raise RuntimeError(f"Credentials are forbidden for index {entry.name or redact_url(entry.url)}")
+        return clean_url, None
+    if not username and not password and host:
+        try:
+            auth = netrc.netrc(os.environ.get("NETRC")).authenticators(host)
+        except (OSError, netrc.NetrcParseError):
+            auth = None
+        if auth:
+            username, _account, password = auth
+    if not password and host and (username is not None or entry.authenticate == "always" or search_uv_store):
+        cache_key = (host, username)
+        with _INDEX_AUTH_LOCK:
+            cached = _INDEX_AUTH_CACHE.get(cache_key) if cache_key in _INDEX_AUTH_CACHE else Ellipsis
+        if cached is Ellipsis:
+            token: str | None = None
+            try:
+                args = ["auth", "token"]
+                if username:
+                    args.extend(["--username", username])
+                args.append(host)
+                proc = run_command(uv_command(context, args), timeout=5)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    token = proc.stdout.strip().splitlines()[-1]
+            except Exception:
+                token = None
+            with _INDEX_AUTH_LOCK:
+                _INDEX_AUTH_CACHE[cache_key] = token
+            password = token
+        else:
+            password = cached
+    if password:
+        user = username or "__token__"
+        encoded = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        return clean_url, f"Basic {encoded}"
+    if entry.authenticate == "always":
+        raise RuntimeError(f"Authentication is required for index {entry.name or redact_url(entry.url)}")
+    return clean_url, None
 
 
 def version_from_distribution_filename(filename: str, package_name: str) -> str | None:
@@ -1462,16 +1927,27 @@ def version_from_distribution_filename(filename: str, package_name: str) -> str 
     return None
 
 
-def versions_from_simple_json(data: object, package_name: str) -> tuple[set[str], set[str]]:
+def requires_python_allows(specifier: object, python_version: str) -> bool:
+    if specifier is None or not str(specifier).strip():
+        return True
+    if SpecifierSet is None:
+        return False
+    try:
+        return bool(SpecifierSet(str(specifier)).contains(python_version, prereleases=True))
+    except (InvalidSpecifier, ValueError):
+        return False
+
+
+def versions_from_simple_json(data: object, package_name: str, python_version: str = "") -> tuple[set[str], set[str]]:
     versions: set[str] = set()
     yanked_only: set[str] = set()
     available: set[str] = set()
     if not isinstance(data, dict):
         return versions, set()
     raw_versions = data.get("versions")
-    if isinstance(raw_versions, list):
-        versions.update(str(version) for version in raw_versions if isinstance(version, str))
     files = data.get("files")
+    if isinstance(raw_versions, list) and not isinstance(files, list):
+        versions.update(str(version) for version in raw_versions if isinstance(version, str))
     if isinstance(files, list):
         for item in files:
             if not isinstance(item, dict):
@@ -1482,6 +1958,8 @@ def versions_from_simple_json(data: object, package_name: str) -> tuple[set[str]
             version = version_from_distribution_filename(filename, package_name)
             if not version:
                 continue
+            if python_version and not requires_python_allows(item.get("requires-python"), python_version):
+                continue
             versions.add(version)
             if item.get("yanked"):
                 yanked_only.add(version)
@@ -1490,15 +1968,17 @@ def versions_from_simple_json(data: object, package_name: str) -> tuple[set[str]
     return versions, yanked_only - available
 
 
-def versions_from_simple_html(text: str, package_name: str) -> tuple[set[str], set[str]]:
+def versions_from_simple_html(text: str, package_name: str, python_version: str = "") -> tuple[set[str], set[str]]:
     parser = SimpleRepositoryLinkParser()
     parser.feed(text)
     versions: set[str] = set()
     yanked_only: set[str] = set()
     available: set[str] = set()
-    for href, yanked in parser.links:
+    for href, yanked, requires_python in parser.links:
         version = version_from_distribution_filename(href, package_name)
         if not version:
+            continue
+        if python_version and not requires_python_allows(requires_python, python_version):
             continue
         versions.add(version)
         if yanked:
@@ -1508,44 +1988,123 @@ def versions_from_simple_html(text: str, package_name: str) -> tuple[set[str], s
     return versions, yanked_only - available
 
 
-def fetch_available_versions(package_name: str, timeout: float = 12.0) -> tuple[list[str], set[str]]:
-    """Return (sorted versions, versions whose files are all yanked) across configured indexes."""
-    versions: set[str] = set()
-    yanked: set[str] = set()
-    not_yanked: set[str] = set()
-    errors: list[str] = []
-    for index_url in configured_index_urls():
+_VERSION_LOOKUP_CACHE: dict[tuple[object, ...], tuple[float, list[str], set[str]]] = {}
+_VERSION_LOOKUP_INFLIGHT: dict[tuple[object, ...], threading.Event] = {}
+_VERSION_LOOKUP_LOCK = threading.Lock()
+_DRY_RUN_CACHE: dict[tuple[object, ...], float] = {}
+_DRY_RUN_LOCK = threading.Lock()
+
+
+def fetch_versions_from_index(
+    entry: IndexEntry,
+    package_name: str,
+    context: PythonContext,
+    timeout: float,
+) -> tuple[bool, set[str], set[str]]:
+    content_type = ""
+    body = ""
+    url = ""
+    for attempt in range(2):
+        index_url, authorization = index_authorization(entry, context, search_uv_store=attempt > 0)
         url = simple_project_url(index_url, package_name)
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/vnd.pypi.simple.v1+json, text/html;q=0.2",
-                "User-Agent": "tuv/0.1",
-            },
-        )
+        headers = {
+            "Accept": "application/vnd.pypi.simple.v1+json, text/html;q=0.2",
+            "Accept-Encoding": "identity",
+            "User-Agent": "tuv/0.2",
+        }
+        if authorization:
+            headers["Authorization"] = authorization
+        request = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 content_type = response.headers.get("Content-Type", "")
-                body = response.read().decode("utf-8", errors="replace")
+                body_bytes = response.read(20 * 1024 * 1024 + 1)
+                if len(body_bytes) > 20 * 1024 * 1024:
+                    raise RuntimeError("Simple-index response exceeded 20 MiB")
+                body = body_bytes.decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404 or exc.code in entry.ignore_error_codes:
+                return False, set(), set()
+            if attempt == 0 and exc.code in {401, 403} and entry.authenticate != "never":
+                continue
+            raise RuntimeError(f"{redact_url(url)} returned HTTP {exc.code}") from exc
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
-            continue
-        try:
-            if "json" in content_type or body.lstrip().startswith("{"):
-                found, found_yanked = versions_from_simple_json(json.loads(body), package_name)
-            else:
-                found, found_yanked = versions_from_simple_html(body, package_name)
+            detail = sanitize_terminal_text(exc)
+            parsed = urllib.parse.urlsplit(entry.url)
+            secret_values = [parsed.username, parsed.password]
+            secret_values.extend(value for _name, value in urllib.parse.parse_qsl(parsed.query))
+            for secret in secret_values:
+                if secret:
+                    detail = detail.replace(secret, "***")
+                    detail = detail.replace(urllib.parse.unquote(secret), "***")
+            raise RuntimeError(f"{redact_url(url)}: {detail}") from exc
+    if "json" in content_type or body.lstrip().startswith("{"):
+        found, found_yanked = versions_from_simple_json(json.loads(body), package_name, context.version)
+    else:
+        found, found_yanked = versions_from_simple_html(body, package_name, context.version)
+    return True, found, found_yanked
+
+
+def fetch_available_versions(
+    package_name: str,
+    context: PythonContext,
+    timeout: float = 12.0,
+) -> tuple[list[str], set[str]]:
+    """Return versions using uv's effective index priority and strategy."""
+    config = effective_index_config(package_name, context)
+    cache_key = (
+        canonicalize_name(package_name),
+        context.version,
+        config.strategy,
+        tuple((entry.name, redact_url(entry.url), entry.explicit, entry.default) for entry in config.entries),
+    )
+    while True:
+        with _VERSION_LOOKUP_LOCK:
+            cached = _VERSION_LOOKUP_CACHE.get(cache_key)
+            if cached is not None and time.monotonic() - cached[0] < 600:
+                return list(cached[1]), set(cached[2])
+            inflight = _VERSION_LOOKUP_INFLIGHT.get(cache_key)
+            owner = inflight is None
+            if owner:
+                inflight = threading.Event()
+                _VERSION_LOOKUP_INFLIGHT[cache_key] = inflight
+        if owner:
+            break
+        assert inflight is not None
+        inflight.wait(timeout * max(1, len(config.entries)) + 2.0)
+    try:
+        versions: set[str] = set()
+        yanked: set[str] = set()
+        not_yanked: set[str] = set()
+        project_found = False
+        for entry in config.entries:
+            try:
+                found_project, found, found_yanked = fetch_versions_from_index(entry, package_name, context, timeout)
+            except Exception as exc:
+                raise RuntimeError(f"Version lookup failed: {sanitize_terminal_text(exc)}") from exc
+            if not found_project:
+                continue
+            project_found = True
             versions.update(found)
             yanked.update(found_yanked)
             not_yanked.update(found - found_yanked)
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-    yanked -= not_yanked
-    if versions:
-        return sorted(versions, key=version_key), yanked
-    if errors:
-        raise RuntimeError("Version lookup failed: " + "; ".join(errors[-3:]))
-    return [], set()
+            if config.strategy == "first-index":
+                break
+            if config.strategy == "unsafe-first-match" and found:
+                break
+        yanked -= not_yanked
+        result = sorted(versions, key=version_key)
+        if not result and not project_found:
+            raise RuntimeError(f"Package {package_name} was not found on the configured uv indexes")
+        with _VERSION_LOOKUP_LOCK:
+            _VERSION_LOOKUP_CACHE[cache_key] = (time.monotonic(), list(result), set(yanked))
+        return result, yanked
+    finally:
+        with _VERSION_LOOKUP_LOCK:
+            event = _VERSION_LOOKUP_INFLIGHT.pop(cache_key, None)
+            if event is not None:
+                event.set()
 
 
 def build_package_rows(context: PythonContext, updated_names: set[str]) -> tuple[list[PackageRow], str | None]:
@@ -1650,11 +2209,7 @@ def pins_file_path() -> Path:
     return Path.home() / ".tuv" / "pins.json"
 
 
-def load_pins() -> dict[str, set[str]]:
-    try:
-        data = json.loads(pins_file_path().read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def parse_pins_data(data: object) -> dict[str, set[str]]:
     result: dict[str, set[str]] = {}
     if isinstance(data, dict):
         for key, values in data.items():
@@ -1665,14 +2220,104 @@ def load_pins() -> dict[str, set[str]]:
     return result
 
 
-def save_pins(pins: dict[str, set[str]]) -> None:
+def read_pins_file(quarantine_malformed: bool = False) -> dict[str, set[str]]:
+    path = pins_file_path()
+    try:
+        return parse_pins_data(json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        if quarantine_malformed:
+            suffix = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+            corrupt = path.with_name(f"pins.corrupt-{suffix}.json")
+            try:
+                os.replace(path, corrupt)
+            except OSError:
+                pass
+        return {}
+    except OSError:
+        return {}
+
+
+def acquire_pins_lock(timeout: float = 3.0, stale_after: float = 30.0) -> Path | None:
+    lock_path = pins_file_path().with_suffix(".lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, str(os.getpid()).encode("ascii", "replace"))
+            finally:
+                os.close(fd)
+            return lock_path
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > stale_after:
+                    lock_path.unlink()
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
+        except OSError:
+            return None
+
+
+def release_pins_lock(lock_path: Path | None) -> None:
+    if lock_path is None:
+        return
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
+def load_pins() -> dict[str, set[str]]:
+    lock = acquire_pins_lock(timeout=0.5)
+    try:
+        return read_pins_file(quarantine_malformed=lock is not None)
+    finally:
+        release_pins_lock(lock)
+
+
+def update_pinned_package(context_id: str, package_name: str, pinned: bool) -> tuple[dict[str, set[str]], str | None]:
+    lock = acquire_pins_lock()
+    if lock is None:
+        return read_pins_file(), "Could not lock the pin state file; another Tuv process may be updating it"
+    temp_path: Path | None = None
     try:
         path = pins_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        pins = read_pins_file(quarantine_malformed=True)
+        names = pins.setdefault(context_id, set())
+        normalized = canonicalize_name(package_name)
+        if pinned:
+            names.add(normalized)
+        else:
+            names.discard(normalized)
+            if not names:
+                pins.pop(context_id, None)
         payload = {key: sorted(values) for key, values in pins.items() if values}
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    except OSError:
-        pass
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with open(temp_path, "x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        return pins, None
+    except OSError as exc:
+        return read_pins_file(), f"Could not save pins: {exc}"
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        release_pins_lock(lock)
 
 
 def last_lines(text: str, count: int = 8) -> str:
@@ -1786,30 +2431,45 @@ class Terminal:
         data = os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
         if data == "\x1b":
             sequence = data
-            end = time.time() + 0.03
-            while time.time() < end:
-                ready, _, _ = select.select([sys.stdin], [], [], 0)
+            end = time.monotonic() + 0.03
+            while True:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([sys.stdin], [], [], remaining)
                 if not ready:
-                    time.sleep(0.002)
-                    continue
+                    break
                 sequence += os.read(sys.stdin.fileno(), 1).decode(errors="ignore")
+                if sequence in ESCAPE_KEYS:
+                    return ESCAPE_KEYS[sequence]
+                if not any(candidate.startswith(sequence) for candidate in ESCAPE_KEYS):
+                    break
             return normalize_key(sequence)
         return normalize_key(data)
 
     def _read_windows_key(self, timeout: float) -> str | None:
         import msvcrt
 
-        deadline = time.time() + timeout
-        while True:
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch()
-                if ch in ("\x00", "\xe0"):
-                    code = msvcrt.getwch()
-                    return WINDOWS_SPECIAL_KEYS.get(code)
-                return normalize_key(ch)
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.01)
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                return WINDOWS_SPECIAL_KEYS.get(msvcrt.getwch())
+            return normalize_key(ch)
+        if timeout <= 0:
+            return None
+        try:
+            handle = ctypes.windll.kernel32.GetStdHandle(-10)
+            ctypes.windll.kernel32.WaitForSingleObject(handle, max(1, int(timeout * 1000)))
+        except Exception:
+            deadline = time.monotonic() + timeout
+            while not msvcrt.kbhit() and time.monotonic() < deadline:
+                time.sleep(0.001)
+        if not msvcrt.kbhit():
+            return None
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return WINDOWS_SPECIAL_KEYS.get(msvcrt.getwch())
+        return normalize_key(ch)
 
 
 WINDOWS_SPECIAL_KEYS = {
@@ -1826,6 +2486,7 @@ WINDOWS_SPECIAL_KEYS = {
     "=": "f3",
     ">": "f4",
     "?": "f5",
+    "@": "f6",
     "C": "f9",
     "D": "f10",
 }
@@ -1849,6 +2510,7 @@ ESCAPE_KEYS = {
     "\x1b[14~": "f4",
     "\x1bOS": "f4",
     "\x1b[15~": "f5",
+    "\x1b[17~": "f6",
     "\x1b[20~": "f9",
     "\x1b[21~": "f10",
     "\x1b[24~": "f12",
@@ -1879,7 +2541,9 @@ class TuvApp:
         self.contexts: list[PythonContext] = []
         self.context_index = 0
         self.context_overlay = False
+        self.context_overlay_pending = False
         self.context_overlay_index = 0
+        self.context_overlay_scroll = 0
         self.version_overlay = False
         self.version_overlay_row: str | None = None
         self.version_overlay_index = 0
@@ -1904,6 +2568,7 @@ class TuvApp:
         self.rediscover_preserve = False
         self.pending_select_root: str | None = None
         self.discovery_error: str | None = None
+        self.quick_context_loaded = False
         self.refreshing = False
         self.refresh_context_id: str | None = None
         self.refresh_generation = 0
@@ -1916,7 +2581,7 @@ class TuvApp:
         self.active_install_context_id: str | None = None
         self.install_proc: subprocess.Popen[str] | None = None
         self.install_proc_lock = threading.Lock()
-        self.install_cancelled = False
+        self.install_cancel_event = threading.Event()
         self.wait_queue: list[tuple[str, str, str]] = []
         self.bulk_active = False
         self.bulk_queue: list[tuple[str, str]] = []
@@ -1929,6 +2594,13 @@ class TuvApp:
         self.prompt: Prompt | None = None
         self.info_open = False
         self.info_scroll = 0
+        self.info_tab = 0
+        self.health_context_id: str | None = None
+        self.health_generation = 0
+        self.health_status = "unknown"
+        self.health_issue_count: int | None = None
+        self.health_lines: list[str] = []
+        self.health_loading = False
         self.report_open = False
         self.report_title = ""
         self.report_lines: list[str] = []
@@ -1993,8 +2665,7 @@ class TuvApp:
                     self.terminal.write(CLEAR + HOME)
                 screen = self.render()
                 if screen != self.last_render:
-                    self.terminal.write(HOME + screen)
-                    self.last_render = screen
+                    self.write_render_diff(screen)
                 # Drain buffered keys so held-down navigation stays responsive.
                 key = self.terminal.read_key(0.08)
                 handled = 0
@@ -2005,15 +2676,29 @@ class TuvApp:
             self.terminate_install_process()
             return 0
 
+    def write_render_diff(self, screen: str) -> None:
+        if not self.last_render:
+            self.terminal.write(HOME + screen)
+            self.last_render = screen
+            return
+        previous = self.last_render.splitlines()
+        current = screen.splitlines()
+        if len(previous) != len(current):
+            self.terminal.write(HOME + screen)
+            self.last_render = screen
+            return
+        changes = [f"\x1b[{index + 1};1H{line}" for index, line in enumerate(current) if line != previous[index]]
+        if changes:
+            self.terminal.write("".join(changes))
+        self.last_render = screen
+
     def terminate_install_process(self) -> None:
+        self.install_cancel_event.set()
         with self.install_proc_lock:
             proc = self.install_proc
         if proc is None:
             return
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        terminate_process_tree(proc)
 
     def start_context_discovery(self, preserve_current: bool = False) -> None:
         if self.discovering_contexts:
@@ -2025,6 +2710,10 @@ class TuvApp:
 
         def worker() -> None:
             try:
+                if not preserve_current:
+                    quick_contexts = discover_priority_contexts()
+                    if quick_contexts:
+                        self.event_queue.put(("contexts_quick", quick_contexts))
                 contexts = discover_contexts()
                 self.event_queue.put(("contexts_done", contexts))
             except Exception as exc:
@@ -2045,7 +2734,16 @@ class TuvApp:
         if not self.contexts:
             self.discovery_error = "Tuv could not find any usable Python context."
             self.set_message(self.discovery_error, "error")
+            self.context_overlay_pending = False
             return
+        if self.quick_context_loaded and previous is not None:
+            self.quick_context_loaded = False
+            for index, context in enumerate(self.contexts):
+                if context.id == previous.id:
+                    self.context_index = index
+                    self.context_overlay_index = index
+                    self.open_pending_context_selector()
+                    return
         if self.pending_select_root:
             wanted = stable_context_id("venv", Path(self.pending_select_root))
             self.pending_select_root = None
@@ -2054,6 +2752,7 @@ class TuvApp:
                     self.context_index = index
                     self.context_overlay_index = index
                     self.load_current_context()
+                    self.open_pending_context_selector()
                     return
         if preserve and previous is not None:
             for index, context in enumerate(self.contexts):
@@ -2061,14 +2760,23 @@ class TuvApp:
                     self.context_index = index
                     self.context_overlay_index = min(self.context_overlay_index, len(self.contexts) - 1)
                     self.message = f"Contexts rescanned: {len(self.contexts)} found"
+                    self.open_pending_context_selector()
                     return
         self.context_index = self.default_context_index()
         self.context_overlay_index = self.context_index
         self.load_current_context()
+        self.open_pending_context_selector()
 
     def on_contexts_failed(self, error: str) -> None:
         self.discovering_contexts = False
         self.rediscover_preserve = False
+        if self.quick_context_loaded and self.contexts:
+            self.quick_context_loaded = False
+            self.discovery_error = f"Full context discovery failed: {last_lines(error, 2)}"
+            self.set_message(self.discovery_error, "warn")
+            self.open_pending_context_selector()
+            return
+        self.context_overlay_pending = False
         self.contexts = []
         self.discovery_error = f"Context discovery failed: {last_lines(error, 2)}"
         self.set_message(self.discovery_error, "error")
@@ -2101,15 +2809,11 @@ class TuvApp:
         self.set_message("Quit cancelled; the operation continues", "warn")
 
     def cancel_active_install(self) -> None:
+        self.install_cancel_event.set()
         with self.install_proc_lock:
             proc = self.install_proc
-            if proc is not None:
-                self.install_cancelled = True
         if proc is not None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            terminate_process_tree(proc)
         if self.bulk_active:
             self.bulk_queue = []
 
@@ -2189,6 +2893,13 @@ class TuvApp:
         self.pending_after_refresh_action = False
         self.info_open = False
         self.info_scroll = 0
+        self.info_tab = 0
+        self.health_context_id = context.id
+        self.health_generation = self.refresh_generation
+        self.health_status = "unknown"
+        self.health_issue_count = None
+        self.health_lines = []
+        self.health_loading = False
         self.report_open = False
         self.report_lines = []
         self.report_scroll = 0
@@ -2265,6 +2976,12 @@ class TuvApp:
         self.refresh_context_id = context.id
         self.refresh_generation += 1
         generation = self.refresh_generation
+        self.health_context_id = context.id
+        self.health_generation = generation
+        self.health_status = "unknown"
+        self.health_issue_count = None
+        self.health_lines = []
+        self.health_loading = False
         self.outdated_loading = False
         self.dependency_loading = False
         self.pending_after_refresh_action = False
@@ -2303,6 +3020,35 @@ class TuvApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_contexts_quick(self, contexts: list[PythonContext]) -> None:
+        if not self.discovering_contexts or self.contexts or not contexts:
+            return
+        self.contexts = contexts
+        self.context_index = self.default_context_index()
+        self.context_overlay_index = self.context_index
+        self.quick_context_loaded = True
+        self.load_current_context()
+
+    def start_health_check(self, context: PythonContext, generation: int) -> None:
+        if self.health_loading and self.health_context_id == context.id and self.health_generation == generation:
+            return
+        self.health_context_id = context.id
+        self.health_generation = generation
+        self.health_status = "checking"
+        self.health_issue_count = None
+        self.health_loading = True
+
+        def worker() -> None:
+            try:
+                command = uv_command(context, ["pip", "check", "--python", context.uv_target])
+                proc = run_command(command, timeout=120)
+                payload = (context.id, generation, proc.returncode, proc.stdout, proc.stderr, None)
+            except Exception as exc:
+                payload = (context.id, generation, None, "", "", str(exc))
+            self.event_queue.put(("health_done", payload))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def process_events(self) -> None:
         while True:
             try:
@@ -2317,6 +3063,8 @@ class TuvApp:
                 self.on_refresh_failed(context_id, generation, error, install_result)
             elif event == "contexts_done":
                 self.on_contexts_done(payload)  # type: ignore[arg-type]
+            elif event == "contexts_quick":
+                self.on_contexts_quick(payload)  # type: ignore[arg-type]
             elif event == "contexts_failed":
                 self.on_contexts_failed(str(payload))
             elif event == "outdated_done":
@@ -2325,6 +3073,9 @@ class TuvApp:
             elif event == "dependency_done":
                 context_id, generation, dependency_payload, error = payload  # type: ignore[misc]
                 self.on_dependency_done(context_id, generation, dependency_payload, error)
+            elif event == "health_done":
+                context_id, generation, returncode, stdout, stderr, error = payload  # type: ignore[misc]
+                self.on_health_done(context_id, generation, returncode, stdout, stderr, error)
             elif event == "install_done":
                 self.on_install_done(payload)  # type: ignore[arg-type]
             elif event == "runner_uv_done":
@@ -2402,7 +3153,6 @@ class TuvApp:
         self.scroll = min(self.scroll, max(0, len(self.view) - 1))
         self.restore_bulk_failed_rows()
         self.prune_target_overrides()
-
         if install_result is not None:
             self.installing = False
             self.active_install_context_id = None
@@ -2425,8 +3175,16 @@ class TuvApp:
 
         context = self.context
         if context is not None and context.id == context_id and not self.installing:
-            self.start_dependency_refresh(context, generation)
-            self.start_outdated_refresh(context, generation)
+            if self.bulk_active and self.bulk_queue and install_result is not None:
+                # Between bulk items only the installed list is needed to detect
+                # dependency-side version changes. Defer network outdated lookup,
+                # metadata traversal, and health checks until the final item.
+                self.finish_full_refresh()
+            else:
+                self.start_dependency_refresh(context, generation)
+                self.start_outdated_refresh(context, generation)
+                if not self.bulk_active:
+                    self.start_health_check(context, generation)
         else:
             self.finish_full_refresh()
 
@@ -2557,6 +3315,45 @@ class TuvApp:
             row.dependency_packages = dependency_packages.get(row.name, [])
             row.usage_packages = usage_packages.get(row.name, [])
             row.description = descriptions.get(row.name)
+
+    def on_health_done(
+        self,
+        context_id: str,
+        generation: int,
+        returncode: int | None,
+        stdout: str,
+        stderr: str,
+        error: str | None,
+    ) -> None:
+        if self.context is None or self.context.id != context_id or generation != self.refresh_generation:
+            return
+        self.health_loading = False
+        self.health_context_id = context_id
+        self.health_generation = generation
+        combined = [line.rstrip() for line in (stdout + "\n" + stderr).splitlines() if line.strip()]
+        if error is not None or returncode is None:
+            self.health_status = "error"
+            self.health_issue_count = None
+            self.health_lines = ["Status: check failed", "", error or "Unknown health-check failure"]
+            return
+        if returncode == 0:
+            self.health_status = "healthy"
+            self.health_issue_count = 0
+            self.health_lines = ["Status: healthy", "", *(combined or ["All installed packages are compatible"])]
+            return
+        match = re.search(r"\bFound\s+(\d+)\s+(?:incompatibilit|issue|problem)", "\n".join(combined), re.IGNORECASE)
+        issue_count = int(match.group(1)) if match else None
+        diagnostic_lines = [
+            line
+            for line in stdout.splitlines()
+            if line.strip() and not line.lower().startswith(("checked ", "using python "))
+        ]
+        if issue_count is None and diagnostic_lines:
+            issue_count = len(diagnostic_lines)
+        self.health_status = "issues"
+        self.health_issue_count = issue_count
+        count_text = str(issue_count) if issue_count is not None else "one or more"
+        self.health_lines = [f"Status: {count_text} compatibility issue(s)", "", *(combined or ["uv pip check failed"])]
 
     def restore_bulk_failed_rows(self) -> None:
         if not self.bulk_failed_results:
@@ -2859,6 +3656,9 @@ class TuvApp:
             )
         else:
             self.message = f"Update all complete: {updated} updated"
+        context = self.context
+        if context is not None:
+            self.start_health_check(context, self.refresh_generation)
         self.maybe_start_waiting_install()
 
     def open_report(self, title: str, lines: list[str]) -> None:
@@ -2889,6 +3689,9 @@ class TuvApp:
         self.ensure_version_overlay_visible()
 
     def start_version_lookup(self, row: PackageRow, pending_direction: int | None = None) -> bool:
+        context = self.context
+        if context is None:
+            return False
         if row.full_versions_loaded:
             return False
         if self.version_loading:
@@ -2916,7 +3719,7 @@ class TuvApp:
 
         def worker(package_name: str) -> None:
             try:
-                versions, yanked = fetch_available_versions(package_name)
+                versions, yanked = fetch_available_versions(package_name, context)
                 self.event_queue.put(("versions_done", (token, canonicalize_name(package_name), versions, yanked, None)))
             except Exception as exc:
                 self.event_queue.put(("versions_done", (token, canonicalize_name(package_name), [], set(), str(exc))))
@@ -3027,6 +3830,21 @@ class TuvApp:
             self.apply_version_direction(row, pending_direction)
 
     def handle_key(self, key: str) -> None:
+        if key in {"\x1b", "escape", "Escape", "ESC"}:
+            key = "esc"
+        if key == "q" and (
+            self.prompt
+            or self.report_open
+            or self.info_open
+            or self.version_overlay
+            or self.context_overlay
+            or self.context_overlay_pending
+        ):
+            key = "esc"
+        if self.context_overlay_pending and key == "esc":
+            self.context_overlay_pending = False
+            self.set_message("Context selector cancelled", "warn")
+            return
         if self.input_mode:
             self.handle_input_key(key)
             return
@@ -3040,6 +3858,13 @@ class TuvApp:
             if key in {"esc", "enter", "f3"}:
                 self.info_open = False
                 self.info_scroll = 0
+                self.info_tab = 0
+            elif key == "left":
+                self.change_info_tab(-1)
+            elif key == "right":
+                self.change_info_tab(1)
+            elif key in {"1", "2", "3"}:
+                self.set_info_tab(int(key) - 1)
             elif key == "up":
                 self.info_scroll = max(0, self.info_scroll - 1)
             elif key == "down":
@@ -3088,8 +3913,10 @@ class TuvApp:
         elif lowered == "/":
             self.input_mode = "filter"
             self.input_buffer = self.filter_text
-        elif lowered == "i":
+        elif lowered == "n":
             self.request_new_package()
+        elif lowered == "i":
+            self.open_information()
         elif lowered == "p":
             self.toggle_pin()
         elif key == "delete":
@@ -3100,12 +3927,12 @@ class TuvApp:
             self.open_version_selector()
         elif key == "f5":
             self.rescan_contexts()
+        elif key == "f6":
+            self.open_health_report()
         elif key == "f9" or lowered == "c":
-            self.context_overlay = True
-            self.context_overlay_index = self.context_index
+            self.request_context_selector()
         elif key == "f3":
-            self.info_open = True
-            self.info_scroll = 0
+            self.open_information()
         elif lowered == "r":
             context = self.context
             if context:
@@ -3204,6 +4031,35 @@ class TuvApp:
         elif key == "end":
             self.report_scroll = 10**9
 
+    def open_information(self) -> None:
+        self.info_open = True
+        self.info_scroll = 0
+        self.info_tab = 0
+
+    def set_info_tab(self, index: int) -> None:
+        self.info_tab = max(0, min(2, index))
+        self.info_scroll = 0
+
+    def change_info_tab(self, direction: int) -> None:
+        self.set_info_tab((self.info_tab + direction) % 3)
+
+    def open_health_report(self) -> None:
+        context = self.context
+        if context is None:
+            return
+        if self.health_loading:
+            self.set_message("Environment health check is still running", "warn")
+            return
+        if (
+            self.health_context_id != context.id
+            or self.health_generation != self.refresh_generation
+            or self.health_status == "unknown"
+        ):
+            self.start_health_check(context, self.refresh_generation)
+            self.message = "Checking environment health"
+            return
+        self.open_report("Environment health", self.health_lines or ["Status: not checked"])
+
     def handle_version_overlay_key(self, key: str) -> None:
         if key in {"esc", "f4"}:
             self.version_overlay = False
@@ -3281,14 +4137,14 @@ class TuvApp:
         if prompt is None:
             return
         lowered = key.lower() if len(key) == 1 else key
-        if lowered == "y" or key == "enter":
+        if lowered == "y":
             prompt.on_yes()
-        elif lowered == "n" or key == "esc":
+        elif lowered == "n" or key in {"esc", "enter"}:
             self.prompt = None
             self.quit_after_prompt = False
             if prompt.on_no:
                 prompt.on_no()
-            elif key == "esc":
+            elif key in {"esc", "enter"}:
                 self.message = "Cancelled"
 
     def handle_context_overlay_key(self, key: str) -> None:
@@ -3323,6 +4179,25 @@ class TuvApp:
                 self.load_current_context()
             else:
                 self.context_overlay = False
+
+    def request_context_selector(self) -> None:
+        if self.discovering_contexts:
+            self.context_overlay = False
+            self.context_overlay_pending = True
+            self.set_message("Finishing context discovery before opening selector", "warn")
+            return
+        self.context_overlay_pending = False
+        self.context_overlay = True
+        self.context_overlay_index = self.context_index
+        self.context_overlay_scroll = 0
+
+    def open_pending_context_selector(self) -> None:
+        if not self.context_overlay_pending or not self.contexts:
+            return
+        self.context_overlay_pending = False
+        self.context_overlay = True
+        self.context_overlay_index = self.context_index
+        self.context_overlay_scroll = 0
 
     def move_focus(self, amount: int) -> None:
         if not self.view:
@@ -3504,6 +4379,7 @@ class TuvApp:
             target_version=row.target_version,
             installed_version_at_attempt=row.installed_version,
             candidate_versions_at_attempt=list(row.candidate_versions),
+            validation_command=[*command[:-1], "--dry-run", command[-1]],
         )
         return True
 
@@ -3517,26 +4393,91 @@ class TuvApp:
         target_version: str,
         installed_version_at_attempt: str = "",
         candidate_versions_at_attempt: list[str] | None = None,
+        validation_command: list[str] | None = None,
     ) -> None:
         self.installing = True
         self.active_install_context_id = context.id
-        self.install_cancelled = False
+        self.install_cancel_event.clear()
         before_versions = {item.name: item.installed_version for item in self.rows}
         candidates = candidate_versions_at_attempt or []
+        validation_key = (
+            context.id,
+            tuple(sorted(before_versions.items())),
+            tuple(validation_command or []),
+        )
 
         def worker() -> None:
             start = time.time()
             proc: subprocess.Popen[str] | None = None
             try:
+                if self.install_cancel_event.is_set():
+                    raise RuntimeError("Operation cancelled before process start")
+                popen_options: dict[str, object] = {}
+                if IS_WINDOWS:
+                    popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    popen_options["start_new_session"] = True
+                with _DRY_RUN_LOCK:
+                    validated_at = _DRY_RUN_CACHE.get(validation_key)
+                    validation_cached = validated_at is not None and time.monotonic() - validated_at < 30.0
+                if validation_command is not None and not validation_cached:
+                    proc = subprocess.Popen(
+                        validation_command,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        shell=False,
+                        **popen_options,
+                    )
+                    with self.install_proc_lock:
+                        self.install_proc = proc
+                    if self.install_cancel_event.is_set():
+                        terminate_process_tree(proc)
+                    check_stdout, check_stderr = proc.communicate()
+                    if proc.returncode != 0 or self.install_cancel_event.is_set():
+                        elapsed = time.time() - start
+                        result = InstallResult(
+                            context_id=context.id,
+                            package_name=package_name,
+                            target_version=target_version,
+                            command=validation_command,
+                            returncode=proc.returncode,
+                            stdout=check_stdout,
+                            stderr=check_stderr,
+                            elapsed=elapsed,
+                            before_versions=before_versions,
+                            installed_version_at_attempt=installed_version_at_attempt,
+                            exit_code=proc.returncode,
+                            stdout_tail=tail_lines(check_stdout),
+                            stderr_tail=tail_lines(check_stderr),
+                            candidate_versions_at_attempt=candidates,
+                            operation=operation,
+                            display_name=display_name,
+                            cancelled=self.install_cancel_event.is_set(),
+                        )
+                        self.event_queue.put(("install_done", result))
+                        return
+                    with _DRY_RUN_LOCK:
+                        validated_at = time.monotonic()
+                        for old_key, timestamp in list(_DRY_RUN_CACHE.items()):
+                            if validated_at - timestamp >= 30.0:
+                                _DRY_RUN_CACHE.pop(old_key, None)
+                        _DRY_RUN_CACHE[validation_key] = validated_at
+                    proc = None
+                    with self.install_proc_lock:
+                        self.install_proc = None
                 proc = subprocess.Popen(
                     command,
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     shell=False,
+                    **popen_options,
                 )
                 with self.install_proc_lock:
                     self.install_proc = proc
+                if self.install_cancel_event.is_set():
+                    terminate_process_tree(proc)
                 stdout, stderr = proc.communicate()
                 elapsed = time.time() - start
                 result = InstallResult(
@@ -3556,7 +4497,7 @@ class TuvApp:
                     candidate_versions_at_attempt=candidates,
                     operation=operation,
                     display_name=display_name,
-                    cancelled=self.install_cancelled,
+                    cancelled=self.install_cancel_event.is_set(),
                 )
             except Exception as exc:
                 elapsed = time.time() - start
@@ -3578,7 +4519,7 @@ class TuvApp:
                     candidate_versions_at_attempt=candidates,
                     operation=operation,
                     display_name=display_name,
-                    cancelled=self.install_cancelled,
+                    cancelled=self.install_cancel_event.is_set(),
                 )
             finally:
                 with self.install_proc_lock:
@@ -3691,6 +4632,9 @@ class TuvApp:
         self.start_new_package_lookup(raw)
 
     def start_new_package_lookup(self, display_name: str) -> None:
+        context = self.context
+        if context is None:
+            return
         if self.version_loading:
             self.set_message("Version lookup already in progress", "warn")
             return
@@ -3701,7 +4645,7 @@ class TuvApp:
 
         def worker() -> None:
             try:
-                versions, yanked = fetch_available_versions(display_name)
+                versions, yanked = fetch_available_versions(display_name, context)
                 self.event_queue.put(("new_versions_done", (token, display_name, versions, yanked, None)))
             except Exception as exc:
                 self.event_queue.put(("new_versions_done", (token, display_name, [], set(), str(exc))))
@@ -3786,6 +4730,7 @@ class TuvApp:
             package_name=canonicalize_name(display_name),
             display_name=display_name,
             target_version=version,
+            validation_command=[*command[:-1], "--dry-run", command[-1]],
         )
 
     def request_create_venv(self) -> None:
@@ -3848,14 +4793,16 @@ class TuvApp:
         context = self.context
         if row is None or context is None or row.operational_error:
             return
-        pins = self.pinned_by_context.setdefault(context.id, set())
-        if row.name in pins:
-            pins.discard(row.name)
-            self.message = f"Unpinned {row.display_name}"
-        else:
-            pins.add(row.name)
+        should_pin = row.name not in self.pinned_by_context.setdefault(context.id, set())
+        updated, error = update_pinned_package(context.id, row.name, should_pin)
+        if error:
+            self.set_message(error, "error")
+            return
+        self.pinned_by_context = updated
+        if should_pin:
             self.message = f"Pinned {row.display_name} (excluded from update all)"
-        save_pins(self.pinned_by_context)
+        else:
+            self.message = f"Unpinned {row.display_name}"
 
     def toggle_selection(self) -> None:
         row = self.focused_row()
@@ -3922,7 +4869,12 @@ class TuvApp:
             label = "Discovering Python contexts..."
         else:
             label = "Starting..."
-        return pad_display(truncate(f"[ {label} ]", width), width)
+        if context is None:
+            return pad_display(truncate(f"[ {label} ]", width), width)
+        badge = f"[{self.health_badge()}]"
+        badge_width = display_width(badge)
+        label_width = max(1, width - badge_width - 1)
+        return pad_display(truncate(f"[ {label} ]", label_width), label_width) + " " + badge
 
     def busy(self) -> bool:
         return (
@@ -3933,7 +4885,21 @@ class TuvApp:
             or self.dependency_loading
             or self.discovering_contexts
             or self.creating_venv
+            or self.health_loading
         )
+
+    def health_badge(self) -> str:
+        if self.health_status == "checking":
+            return "health: checking"
+        if self.health_status == "healthy":
+            return "health: ok"
+        if self.health_status == "issues":
+            if self.health_issue_count is not None:
+                return f"health: {self.health_issue_count} issue(s)"
+            return "health: issues"
+        if self.health_status == "error":
+            return "health: check failed"
+        return "health: unknown"
 
     def status_line(self, width: int) -> str:
         if self.input_mode == "filter":
@@ -4024,29 +4990,45 @@ class TuvApp:
     def footer_line(self, width: int) -> str:
         if width >= 130:
             keys = (
-                "↑/↓ | ←/→ Ver | ↵ Install | Space Sel | / Filter | i New | Del Unins | p Pin"
-                " | F2 Update | F3 Info | F4 Ver | F5 Rescan | F9 Ctx | F10 Quit"
+                "↑/↓ | ←/→ Ver | ↵ Install | Space Sel | / Filter | i Info | n New | Del Unins | p Pin"
+                " | F2 Update | F3 Info | F4 Ver | F5 Rescan | F6 Health | F9 Ctx | F10 Quit"
             )
         elif width >= 100:
-            keys = "↑/↓ | ←/→ | ↵ Inst | Spc Sel | / Filt | i New | Del | p Pin | F2 All | F3 | F4 | F5 | F9 | F10"
+            keys = "↑/↓ | ←/→ | ↵ Inst | Spc Sel | / Filt | i Info | n New | Del | p Pin | F2 All | F3 | F4 | F5 | F6 | F9 | F10"
         elif width >= 72:
-            keys = "↑/↓ | ←/→ | ↵ | Spc | / | i | Del | p | F2 | F3 | F4 | F5 | F9 | F10"
+            keys = "↑/↓ | ←/→ | ↵ | Spc | / | i | n | Del | p | F2 | F3 | F4 | F5 | F6 | F9 | F10"
         else:
-            keys = "↑/↓ ←/→ ↵ Spc / i Del p F2-F10"
+            keys = "↑/↓ ←/→ ↵ Spc / i n Del p F2-F10"
         return pad_display(truncate(keys, width), width)
 
     def dim_background(self, lines: list[str], width: int) -> list[str]:
-        return [MODAL_BACKDROP + strip_ansi(line).ljust(width)[:width] + RESET for line in lines]
+        return [MODAL_BACKDROP + pad_display(truncate(strip_ansi(line), width), width) + RESET for line in lines]
 
     def overlay_contexts(self, lines: list[str], width: int, height: int) -> list[str]:
         overlay_w = min(width - 4, max(50, width * 3 // 4))
-        overlay_h = min(height - 4, max(7, len(self.contexts) + 5))
-        top = max(1, (height - overlay_h) // 2)
+        # Use the full available height when necessary. The previous four-row
+        # outer margin hid contexts that would otherwise fit and made them
+        # appear only after Down moved the viewport.
+        overlay_h = min(height, max(7, len(self.contexts) + 3))
+        top = max(0, (height - overlay_h) // 2)
         left = max(1, (width - overlay_w) // 2)
         items_visible = overlay_h - 3
-        start = max(0, min(self.context_overlay_index, max(0, len(self.contexts) - items_visible)))
-        box = [self.box_border(overlay_w, "top", "Context selector")]
-        box.append(self.box_line("Enter select | n new venv | F5 rescan | Esc close", overlay_w))
+        if self.context_overlay_index < self.context_overlay_scroll:
+            self.context_overlay_scroll = self.context_overlay_index
+        elif self.context_overlay_index >= self.context_overlay_scroll + items_visible:
+            self.context_overlay_scroll = self.context_overlay_index - items_visible + 1
+        self.context_overlay_scroll = max(
+            0,
+            min(self.context_overlay_scroll, max(0, len(self.contexts) - items_visible)),
+        )
+        start = self.context_overlay_scroll
+        title = "Context selector"
+        if len(self.contexts) > items_visible:
+            title += f" ({start + 1}-{min(start + items_visible, len(self.contexts))}/{len(self.contexts)})"
+        elif self.discovering_contexts:
+            title += " (discovering...)"
+        box = [self.box_border(overlay_w, "top", title)]
+        box.append(self.box_line("Enter select | n new venv | F5 rescan | Esc/q close", overlay_w))
         for idx in range(start, start + items_visible):
             if idx < len(self.contexts):
                 marker = ">" if idx == self.context_overlay_index else " "
@@ -4076,11 +5058,11 @@ class TuvApp:
         self.ensure_version_overlay_visible(items_visible)
         start = self.version_overlay_scroll
         box = [self.box_border(overlay_w, "top", title)]
-        hint = "Enter install | Esc close"
+        hint = "Enter install | Esc/q close"
         if self.version_loading:
-            hint = "Loading versions... | Esc close"
+            hint = "Loading versions... | Esc/q close"
         elif self.version_error:
-            hint = f"{self.version_error} | Esc close"
+            hint = f"{self.version_error} | Esc/q close"
         box.append(self.box_line(hint, overlay_w))
         for idx in range(start, start + items_visible):
             if idx < len(self.version_options):
@@ -4131,8 +5113,66 @@ class TuvApp:
             lines.append("  (none)")
         return lines
 
+    def package_tree_lines(self, root: PackageRow, invert: bool) -> list[str]:
+        if not root.metadata_trusted:
+            if self.dependency_loading:
+                return ["Loading installed package metadata..."]
+            return ["Dependency metadata is unavailable for this context."]
+
+        rows_by_name = {row.name: row for row in self.rows}
+        expanded: set[str] = {root.name}
+        output = [self.package_tree_label(root)]
+        repeated = False
+
+        def child_rows(row: PackageRow) -> list[tuple[str, PackageRow | None]]:
+            names = row.usage_packages if invert else row.dependency_packages
+            result: list[tuple[str, PackageRow | None]] = []
+            seen: set[str] = set()
+            for display_name in names:
+                normalized = canonicalize_name(display_name)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                result.append((display_name, rows_by_name.get(normalized)))
+            return result
+
+        def append_children(row: PackageRow, prefix: str, ancestry: set[str]) -> None:
+            nonlocal repeated
+            children = child_rows(row)
+            for index, (display_name, child) in enumerate(children):
+                is_last = index == len(children) - 1
+                connector = "└── " if is_last else "├── "
+                extension = "    " if is_last else "│   "
+                if child is None:
+                    output.append(prefix + connector + display_name + " (installed metadata missing)")
+                    continue
+                label = self.package_tree_label(child)
+                if child.name in ancestry:
+                    output.append(prefix + connector + label + " (cycle)")
+                    continue
+                if child.name in expanded:
+                    output.append(prefix + connector + label + " (*)")
+                    repeated = True
+                    continue
+                output.append(prefix + connector + label)
+                expanded.add(child.name)
+                append_children(child, prefix + extension, {*ancestry, child.name})
+
+        append_children(root, "", {root.name})
+        if repeated:
+            output.extend(["", "(*) Package tree already displayed"])
+        return output
+
+    def package_tree_label(self, row: PackageRow) -> str:
+        label = f"{row.display_name} v{row.installed_version}"
+        if row.target_version != row.installed_version and row.versions_resolved:
+            label += f" (latest: v{row.target_version})"
+        return label
+
     def overlay_info(self, lines: list[str], width: int, height: int) -> list[str]:
         row = self.focused_row()
+        tab_names = ["Details", "Dependencies", "Required by"]
+        title = f"Information - {tab_names[self.info_tab]}"
         if row is None:
             body = ["No package selected."]
         elif row.operational_error:
@@ -4145,6 +5185,17 @@ class TuvApp:
                 "",
                 *(row.last_error_detail or "").splitlines(),
             ]
+        elif self.info_tab in {1, 2}:
+            invert = self.info_tab == 2
+            heading = "Reverse dependency tree" if invert else "Dependency tree"
+            body = [
+                f"Package: {row.display_name}",
+                f"Version: {row.installed_version}",
+                "Views: 1 Details | 2 Dependencies | 3 Required by | Left/Right switch",
+                "",
+                f"{heading}:",
+            ]
+            body.extend(self.package_tree_lines(row, invert))
         elif row.status == "failed" and row.last_error_detail:
             result = row.last_install_result
             exit_code = (
@@ -4172,10 +5223,13 @@ class TuvApp:
                 f"Pinned: {pinned}",
                 *self.package_relation_lines(row),
             ]
-        return self.overlay_text(lines, width, height, "Information", body, scroll_attr="info_scroll")
+        if self.info_tab == 0 and row is not None and not row.operational_error:
+            body = ["Views: 1 Details | 2 Dependencies | 3 Required by | Left/Right switch", "", *body]
+        body = ["Esc/q: close", "", *body]
+        return self.overlay_text(lines, width, height, title, body, scroll_attr="info_scroll")
 
     def overlay_report(self, lines: list[str], width: int, height: int) -> list[str]:
-        body = self.report_lines or ["(empty)"]
+        body = ["Esc/q: close", "", *(self.report_lines or ["(empty)"])]
         return self.overlay_text(lines, width, height, self.report_title or "Report", body, scroll_attr="report_scroll")
 
     def overlay_input(self, lines: list[str], width: int, height: int) -> list[str]:
@@ -4192,7 +5246,7 @@ class TuvApp:
         prompt = self.prompt
         if prompt is None:
             return lines
-        body = [*prompt.message.splitlines(), "", "Y/Enter: yes    N/Esc: no"]
+        body = [*prompt.message.splitlines(), "", "Y: yes    Enter/N/Esc/q: no"]
         return self.overlay_text(lines, width, height, prompt.title, body)
 
     def overlay_text(
@@ -4207,6 +5261,7 @@ class TuvApp:
         overlay_w = min(width - 4, max(50, width * 4 // 5))
         wrapped: list[str] = []
         for line in body:
+            line = sanitize_terminal_text(line)
             if not line:
                 wrapped.append("")
             else:
@@ -4240,9 +5295,9 @@ class TuvApp:
             max_title_width = max(0, inner - 3)
             title_text = truncate(title, max_title_width)
             label = f" {title_text} " if title_text else " "
-            if len(label) >= inner:
+            if display_width(label) >= inner:
                 label = truncate(label, inner)
-            fill = "─" * max(0, inner - len(label))
+            fill = "─" * max(0, inner - display_width(label))
             return "┌" + label + fill + "┐"
         return "┌" + "─" * (width - 2) + "┐"
 
@@ -4251,6 +5306,8 @@ class TuvApp:
 
 
 def char_display_width(ch: str) -> int:
+    if _wcwidth is not None:
+        return max(0, _wcwidth(ch))
     if unicodedata.combining(ch):
         return 0
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
@@ -4261,7 +5318,7 @@ def display_width(text: str) -> int:
 
 
 def truncate(value: object, width: int) -> str:
-    text = str(value)
+    text = sanitize_terminal_text(value)
     if width <= 0:
         return ""
     if display_width(text) <= width:
@@ -4283,6 +5340,30 @@ def pad_display(text: str, width: int) -> str:
     return text + " " * max(0, width - display_width(text))
 
 
+def slice_display(text: str, start: int, width: int) -> str:
+    if width <= 0:
+        return ""
+    end = start + width
+    position = 0
+    output: list[str] = []
+    for ch in text:
+        ch_width = char_display_width(ch)
+        next_position = position + ch_width
+        if ch_width == 0:
+            if output and start <= position <= end:
+                output.append(ch)
+            continue
+        if next_position <= start:
+            position = next_position
+            continue
+        if position >= end or next_position > end:
+            break
+        if position >= start:
+            output.append(ch)
+        position = next_position
+    return "".join(output)
+
+
 def paste_box(lines: list[str], box: list[str], top: int, left: int, width: int) -> list[str]:
     result = list(lines)
     for offset, box_line in enumerate(box):
@@ -4290,24 +5371,83 @@ def paste_box(lines: list[str], box: list[str], top: int, left: int, width: int)
         if row_index >= len(result):
             break
         dimmed = result[row_index].startswith(MODAL_BACKDROP)
-        raw = strip_ansi(result[row_index]).ljust(width)
-        box_width = len(strip_ansi(box_line))
+        raw = pad_display(truncate(strip_ansi(result[row_index]), width), width)
+        box_width = display_width(strip_ansi(box_line))
+        prefix = slice_display(raw, 0, left)
+        suffix_start = left + box_width
+        suffix = slice_display(raw, suffix_start, max(0, width - suffix_start))
         if dimmed:
             result[row_index] = (
                 MODAL_BACKDROP
-                + raw[:left]
+                + prefix
                 + RESET
                 + box_line
                 + MODAL_BACKDROP
-                + raw[left + box_width :]
+                + suffix
                 + RESET
             )
         else:
-            result[row_index] = raw[:left] + box_line + raw[left + box_width :]
+            result[row_index] = prefix + box_line + suffix
     return result
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def sanitize_terminal_text(value: object, allow_newlines: bool = False) -> str:
+    text = str(value)
+    output: list[str] = []
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        code = ord(ch)
+        if ch == "\x1b":
+            index += 1
+            if index >= len(text):
+                break
+            kind = text[index]
+            if kind == "[":
+                index += 1
+                while index < len(text) and not ("@" <= text[index] <= "~"):
+                    index += 1
+                index += 1
+                continue
+            if kind == "]":
+                index += 1
+                while index < len(text):
+                    if text[index] == "\a":
+                        index += 1
+                        break
+                    if text[index] == "\x1b" and index + 1 < len(text) and text[index + 1] == "\\":
+                        index += 2
+                        break
+                    index += 1
+                continue
+            if kind in {"P", "X", "^", "_"}:
+                index += 1
+                while index + 1 < len(text) and not (text[index] == "\x1b" and text[index + 1] == "\\"):
+                    index += 1
+                index = min(len(text), index + 2)
+                continue
+            index += 1
+            continue
+        if ch in {"\n", "\r"}:
+            if allow_newlines and (not output or output[-1] != "\n"):
+                output.append("\n")
+            else:
+                output.append(" ")
+            index += 1
+            continue
+        if ch == "\t":
+            output.append(" ")
+            index += 1
+            continue
+        if code < 32 or 0x7F <= code <= 0x9F or 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069:
+            index += 1
+            continue
+        output.append(ch)
+        index += 1
+    return "".join(output)
 
 
 def strip_ansi(text: str) -> str:

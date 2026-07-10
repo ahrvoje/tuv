@@ -100,12 +100,11 @@ if errorlevel 1 (
   1>&2 echo(tuv: restoring runner pip with ensurepip
   "%TUV_RUNNER_PYTHON%" -m ensurepip --upgrade
   if errorlevel 1 goto runner_bootstrap_failed
-)
-
-"%TUV_RUNNER_PYTHON%" -m pip --version >nul 2>nul
-if errorlevel 1 (
-  set "BOOTSTRAP_STEP=runner pip is unavailable after ensurepip"
-  goto runner_bootstrap_failed
+  "%TUV_RUNNER_PYTHON%" -m pip --version >nul 2>nul
+  if errorlevel 1 (
+    set "BOOTSTRAP_STEP=runner pip is unavailable after ensurepip"
+    goto runner_bootstrap_failed
+  )
 )
 
 1>&2 echo(tuv: ensuring runner uv
@@ -115,12 +114,11 @@ if errorlevel 1 (
   1>&2 echo(tuv: installing runner uv
   "%TUV_RUNNER_PYTHON%" -m pip install uv
   if errorlevel 1 goto runner_bootstrap_failed
-)
-
-"%TUV_RUNNER_PYTHON%" -m uv --version >nul 2>nul
-if errorlevel 1 (
-  set "BOOTSTRAP_STEP=runner uv is unavailable after installation"
-  goto runner_bootstrap_failed
+  "%TUV_RUNNER_PYTHON%" -m uv --version >nul 2>nul
+  if errorlevel 1 (
+    set "BOOTSTRAP_STEP=runner uv is unavailable after installation"
+    goto runner_bootstrap_failed
+  )
 )
 
 set "REQ_HASH="
@@ -140,7 +138,7 @@ if not "%REQ_HASH%"=="%STATE_HASH%" (
   > "%STATE%" echo(%REQ_HASH%
 )
 
-"%TUV_RUNNER_PYTHON%" -c "import packaging" >nul 2>nul
+"%TUV_RUNNER_PYTHON%" -c "import packaging, wcwidth" >nul 2>nul
 if errorlevel 1 (
   1>&2 echo(tuv: repairing runner requirements
   "%TUV_RUNNER_PYTHON%" -m pip install -r "%REQ%"

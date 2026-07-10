@@ -284,6 +284,7 @@ Required native terminal behavior:
 - Use `try`/`finally` so terminal state is restored after errors.
 - Use `os.get_terminal_size()` for responsive table sizing.
 - Redraw the screen after input, package refresh, installation status changes, spinner ticks, and resize events.
+- After the first full frame, write only terminal rows whose rendered content changed; force a full redraw after resize or a viewport-height change.
 - Decode common keyboard sequences for arrows, `PageUp`, `PageDown`, `Left`, `Right`, `Enter`, `F3`, `F4`, `F9`, `F10`, refresh, and quit.
 - Decode `F2` for updating all ready packages.
 - Decode `F4` for opening a package version selector overlay.
@@ -294,6 +295,7 @@ Input handling:
 
 - POSIX: use `termios`, `tty`, and `select` for raw, non-blocking input.
 - Windows: use `msvcrt.getwch()` for keyboard input.
+- Do not add fixed polling sleeps to ordinary key handling. Complete escape sequences should return as soon as they are recognized; only a bare POSIX `Esc` may wait for the short ambiguity window needed to distinguish it from a function-key sequence.
 - Windows ANSI rendering should enable virtual terminal processing through `ctypes` when needed.
 - Because function-key sequences vary between terminals, `F9` should support common sequences and may have a fallback context-selector key if a terminal cannot report `F9` reliably.
 
@@ -301,6 +303,7 @@ Native UI responsibilities:
 
 - Maintain table viewport state, focused row, and scroll offset.
 - Render the context selector as a lightweight combo overlay.
+- Size the context selector to show every detected context whenever the terminal can physically fit the entries, using the full terminal height when necessary instead of reserving decorative outer margins. When scrolling is unavoidable, show the visible range and total context count in the title.
 - Render package version choices as a lightweight combo overlay.
 - When any modal dialog or selector is active, render the background content dimmed: it should lose color intensity and appear slightly darker while the modal remains visually dominant.
 - When a modal overlay or dialog has a title, embed the title elegantly into the top-left portion of the dialog border instead of placing it as a separate body line.
@@ -326,6 +329,7 @@ Tuv should keep runtime dependencies small.
 Recommended dependencies:
 
 - `packaging`: package name normalization and version ordering.
+- `wcwidth`: terminal-cell width calculation for wide, combining, and zero-width Unicode characters.
 - `uv`: backend package manager supplied by the resolved uv provider. It may be installed in a selected venv, installed in the selected context's reference interpreter, available as standalone system `uv`, or installed in the Tuv runner venv.
 
 `uv` is ensured inside the Tuv runner venv at startup as the guaranteed fallback provider, while more local context providers and standalone system `uv` still take precedence for package operations. No TUI framework dependency is required. The launchers should rely only on shell or batch features, OS Python discovery commands, the selected newest Python interpreter, and any discovered uv providers. Python dependencies are required only after the runner environment exists, except for the confirmed Tuv-runner-venv `uv` bootstrap.
@@ -377,6 +381,10 @@ Default selected context:
 4. Newest discovered interpreter.
 5. `tuv venv`.
 
+Initial discovery should publish the probable default context as soon as it is usable and begin its installed-package refresh while the complete interpreter and venv scan continues in the background. The full result replaces the provisional context list without restarting an already-running refresh for the same context. Interpreter and uv-provider probes must share concurrent in-flight work and cache successful results for the process lifetime.
+
+The provisional context list is an internal startup optimization, not a complete selector result. If the user requests the context selector while discovery or rescan is running, defer opening it until full discovery completes, then open it with the complete detected list. Do not expose the provisional list as an apparently usable selector.
+
 Interpreter contexts may refer to system Python installations. Installing into those contexts is potentially risky, so the first mutation in an interpreter context must show a confirmation dialog.
 
 The selected context does not need to contain `uv` or `pip` when a less local provider can manage it. Tuv should resolve a uv provider for the selected context using the provider hierarchy, then inspect and mutate the context through `uv pip ... --python <context>`. A context should be hidden or marked unavailable only when no target interpreter executable can be found or no resolved uv provider can operate on it.
@@ -403,6 +411,7 @@ Top menu:
 - Shows the selected context directly, without a leading `Context:` label.
 - Omits idle/status text such as `Status: idle`; space is reserved for package data and controls.
 - Contains a context selector.
+- Keeps an environment-health badge visible at the right side of the top line. The badge is populated asynchronously by `uv pip check` and reports checking, healthy, compatibility issues, or check failure.
 - The selector is a combo control opened with `F9`.
 - `F9` focuses the context selector and opens the context combo.
 - The combo lists interpreter contexts first, virtual environment contexts second, and `tuv venv` last.
@@ -449,6 +458,7 @@ Bottom indicator:
   - `F2`: update all ready packages.
   - `F3`: open information for the focused row, especially install failure details.
   - `F4`: open a version selector for the focused package.
+  - `F6`: open the latest environment-health report produced by `uv pip check`.
   - `F9`: focus and open the context selector.
   - `F10`: quit the application when no modal dialog or selector is active.
 - May also include:
@@ -495,6 +505,9 @@ Version candidates:
 - Candidate versions should load lazily for the focused row.
 - Candidate version lookup is core package-manager functionality and must be robust, testable, and treated as part of the package operation contract rather than a best-effort embellishment.
 - Candidate version lookup must enumerate available versions through the effective configured package index API, preferably the Python Simple Repository API, including PEP 503 HTML responses and PEP 691 JSON responses where supported by the index.
+- Effective index resolution must honor uv project, user, and system configuration precedence; `UV_CONFIG_FILE` and `UV_NO_CONFIG`; `UV_INDEX`, default/extra index environment variables, explicit/default indexes, package source mappings, and uv's `first-index`, `unsafe-first-match`, and `unsafe-best-match` strategies.
+- Index responses must be filtered by project filename, yanked status, and `Requires-Python`. Before any mutation, run the exact install request through the selected context's resolved uv provider with `--dry-run`; this is the authoritative validation for target platform tags, build availability, source rules, and resolver compatibility.
+- Authentication may come from URL userinfo, named `UV_INDEX_<NAME>_USERNAME/PASSWORD` variables, netrc, or uv's credential store. Auto-authentication should query the credential store only after an authentication challenge. Diagnostics and cache keys must never expose URL credentials or query tokens.
 - Candidate version lookup must use the same configured package server or index choices that uv will use for installation whenever those settings are discoverable, including index URL, extra index URL, credentials from supported environment variables, and local uv configuration files.
 - Tuv must not silently fall back to a different public index when the selected context or project has an explicit configured index that cannot be queried. In that case, keep installed package data visible, mark version data unavailable, and keep affected rows non-installable until the lookup succeeds.
 - Version lookup should use structured parsers for configuration and index responses where available; ad hoc regex parsing is acceptable only as a narrow fallback for formats that cannot otherwise be parsed.
@@ -534,7 +547,7 @@ When the user presses `Enter` on a package row:
 5. If the row's target version was not produced by successful candidate-version resolution for the effective index configuration, do not install.
 6. If the target version equals the installed version, do nothing and show a short status message.
 7. Mark the row as `installing`.
-8. Start an asynchronous background worker that runs `uv pip install`.
+8. Start an asynchronous background worker that first runs the exact command with `--dry-run`, then runs `uv pip install` only when validation succeeds.
 9. Animate the fourth column while the process is running.
 10. Capture stdout, stderr, exit code, and elapsed time.
 11. After the uv process exits, refresh the entire package table for the selected context, because uv may update dependencies as part of the install.
@@ -553,9 +566,13 @@ For normal system interpreter contexts, pass `uv pip` flags needed to explicitly
 
 Only one installation may run at a time. If the user presses `Enter` on another row while an installation is running, Tuv must not start a concurrent uv process. Instead, mark that requested row with the displayed status `Wait`. If the user presses `Enter` repeatedly on the same waiting row, keep the single existing wait request and keep displaying `Wait`; repeated key presses must not enqueue duplicate installs. When the active installation finishes and the full package table refresh completes, Tuv may start a waiting installation if its package row and target version are still valid.
 
+Cancellation must be race-safe even when requested immediately before process creation. Each validation/install process starts in its own process group, and cancellation terminates the complete process tree before reporting the operation cancelled.
+
 ## Update All Ready Packages
 
 `F2` updates all packages currently in `ready` state after user confirmation.
+
+Per-context pins are persisted with an inter-process lock and a same-directory temporary file followed by atomic replacement. Every update reloads and merges the latest on-disk state while holding the lock so concurrent Tuv instances cannot silently overwrite one another. Malformed pin JSON is quarantined before a new valid file is written.
 
 Bulk update rules:
 
@@ -569,6 +586,7 @@ Bulk update rules:
 - Run installs sequentially with the same asynchronous worker used for single-package installs.
 - Never start more than one uv install process at a time.
 - After each package install exits, refresh the full package table before choosing the next package.
+- Between bulk items, refresh the installed package list needed to observe dependency-side changes, but defer outdated-index lookup, dependency metadata traversal, and environment health checks until the final item.
 - Before starting each next package, re-check the refreshed row state.
 - Skip a package when it failed earlier in the current bulk run, was already processed in the current bulk run, is no longer present, or is already installed at the queued latest target version.
 - If a queued package was updated to its queued latest target version earlier in the same bulk run as a dependency-side effect of another install, treat it as complete and skip its own install step.
@@ -625,11 +643,15 @@ For every package row, the information panel must list:
 - Dependency packages: installed packages required by the focused package.
 - Usage packages: installed packages that depend on the focused package.
 
+The information panel also provides dependency-tree and reverse-dependency-tree subviews. They recursively use the same trusted, marker-aware installed metadata graph as the details view, including its conservative handling of installed extra-gated dependencies. `Left`/`Right` or `1`/`2`/`3` switches among details, dependencies, and required-by views. `i` opens the information panel from the main screen, while `n` starts the new-package flow.
+
 These lists should use normalized dependency metadata from the selected context. Empty descriptions and empty lists should be shown explicitly as empty rather than omitted.
 
 ## Modal Behavior
 
-Every modal overlay or dialog must close with `Esc` or `q`.
+Every non-text modal overlay or dialog must close with `Esc` or `q`. Text-entry dialogs close with `Esc`; printable `q` remains available as input for package names, filters, and paths.
+
+Every non-text modal must display both close keys in its visible controls, using wording such as `Esc/q close`. Raw escape input and common normalized spellings of the Escape key must resolve to the same close action.
 
 Modal titles:
 
@@ -648,6 +670,8 @@ Modal examples:
 - Error detail dialogs.
 
 When `Esc` or `q` closes a permission or confirmation dialog, the associated action is cancelled.
+
+Destructive confirmations are fail-closed: only `y` accepts. `Enter`, `n`, `Esc`, and `q` decline.
 
 When no modal overlay or dialog is active, `q` quits the main application. `F10` also quits the main application. `q` must prefer closing the active modal over quitting the app whenever a modal is present.
 
@@ -867,10 +891,12 @@ InstallResult
 - If `Enter` requests another installation while one is running, the requested row displays `Wait` and no concurrent uv install starts.
 - A failed installation row is rendered bold red.
 - `F3` opens package-focused information for the focused row and shows failure details for failed rows.
+- The `F3` panel provides dependency and reverse-dependency tree views recursively derived from the same trusted installed metadata graph as the details view.
 - `F3` labels the installed package version as `Version`.
 - `F3` shows a short package description plus dependency and usage packages for every row.
 - `F3` omits known versions, target version, uninstall marker, row status, and context/interpreter details.
 - The TUI remains responsive during installation.
+- Environment health is checked asynchronously with `uv pip check`; the top-line badge remains visible, and `F6` opens the corresponding health or failure report.
 - After any completed installation, the full package table refreshes so dependency updates made by uv are reflected.
 - Packages installed or updated during the current Tuv session are colored white after refresh.
 - During the post-install refresh, unchanged rows do not briefly flash white while their refreshed status is still loading; they keep their previous stable color until fresh current/outdated status is known.
