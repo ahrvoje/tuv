@@ -3618,6 +3618,10 @@ class TuvApp:
                 self.bulk_summary.append((row.display_name, "skipped", "target no longer available"))
                 continue
             row.target_version = target_version
+            # The between-items refresh rebuilds rows with status "loading",
+            # which begin_install rejects; every gate begin_install checks has
+            # already passed above, so restate the queued state explicitly.
+            row.status = "wait"
             self.bulk_processed.add(normalized)
             self.mark_bulk_pending_waits()
             done = self.bulk_total - len(self.bulk_queue)
