@@ -66,7 +66,7 @@ cd ~/tools/python-3.13
 ./tuv.sh .
 ```
 
-The launcher discovers a usable Python, creates or reuses a script-relative runner environment, installs `requirements.txt`, ensures runner-local `uv`, and starts `tuv.py`.
+The launcher discovers a usable Python, creates or reuses a script-relative runner environment, installs `requirements.txt`, ensures runner-local `uv`, and starts `tuv.py`. When the runner environment is already complete, one probe confirms it and the launcher skips the pip, uv, and requirements steps.
 
 ## Keys
 
@@ -100,3 +100,4 @@ Row markers: `*` before a name means no other installed package requires it (saf
 - `tuv.sh`: Linux/macOS launcher.
 - `requirements.txt`: runner dependencies.
 - `spec.md`: detailed behavior specification.
+- `tests/`: regression tests; run `python -m pytest tests` with `packaging`, `wcwidth`, `uv`, and `pytest` installed.

@@ -33,7 +33,7 @@ The complete deployment consists of exactly these files:
 - `tuv.py`: cross-platform Python application containing the Tuv implementation.
 - `requirements.txt`: Python runtime requirements for the Tuv runner venv.
 
-Generated files and directories, such as the runner virtual environment and install-state markers, are runtime artifacts and are not part of the deployment.
+Generated files and directories, such as the runner virtual environment and install-state markers, are runtime artifacts and are not part of the deployment. The `tests/` directory holds the regression tests and is not deployed either.
 
 ## User Entry Point
 
@@ -81,6 +81,8 @@ The launcher should pass discovery anchors to `tuv.py` through environment varia
 - `TUV_SYSTEM_UV_EXE=<absolute path to standalone system uv>`, only when standalone system uv is available.
 
 `TUV_NEWEST_PYTHON` is a historical environment variable name. In default mode it contains the newest usable platform Python. In explicit cwd-runner mode it contains the selected current-working-directory Python.
+
+`tuv.py --prepare-runner` selects or creates the runner venv and prints the three anchors above plus `TUV_RUNNER_READY=1` or `TUV_RUNNER_READY=0`. It is `1` only when one probe of the runner Python confirmed working `pip`, an importable `uv` module whose binary exists, importable `packaging` and `wcwidth`, and a `.tuv-requirements-state` marker equal to the current SHA-256 of `requirements.txt`. The launcher may then skip the pip, uv, and requirements steps; when it is `0` the launcher runs every repair step as described below.
 
 The launcher must continue to discover the most recent usable platform Python interpreter for default launches and use it for the Tuv runner environment. This preserves predictable startup and venv management even when package operations later choose a more local uv provider for a selected context. The explicit dot argument overrides this default and intentionally uses the current-working-directory Python as the runner Python.
 
@@ -816,14 +818,20 @@ InstallJob
   started_at: timestamp
 
 InstallResult
-  package_name: string
-  requested_version: string
-  installed_version_at_attempt: version string
+  context_id: string
+  package_name: normalized distribution name
+  display_name: package display name
+  operation: install | uninstall
+  target_version: string
+  command: the uv command that produced the result
   exit_code: integer or null when process did not start
-  stdout_tail: list of strings
-  stderr_tail: list of strings
-  elapsed_seconds: float
-  failed_in_bulk_run_id: string or null
+  stdout: captured stdout
+  stderr: captured stderr
+  elapsed: float seconds
+  before_versions: installed versions before the operation, for session-update coloring
+  installed_version_at_attempt: version string
+  candidate_versions_at_attempt: list of version strings
+  cancelled: bool
 ```
 
 ## Acceptance Criteria
@@ -924,7 +932,7 @@ InstallResult
 12. Implement `F2` sequential update-all-ready flow.
 13. Add uninstall-safe package marker.
 14. Add bold-red failed row rendering and `F3` information panel.
-15. Add tests for discovery, explicit `tuv .` cwd-runner mode, runner compatibility and hash-suffixed venv selection, uv provider hierarchy resolution, Tuv-runner pip and uv bootstrap, runner repair, uv JSON parsing, context ordering, active-venv classification, virtual environment deduplication, current-working-directory interpreter detection, robust effective-index-backed version selection, action gating before version resolution, metadata trust gating for uninstall-safe markers, bulk update sequencing, failure detail state, and install state transitions.
+15. Add tests for discovery, explicit `tuv .` cwd-runner mode, runner compatibility and hash-suffixed venv selection, uv provider hierarchy resolution, Tuv-runner pip and uv bootstrap, runner repair, uv JSON parsing, context ordering, active-venv classification, virtual environment deduplication, current-working-directory interpreter detection, robust effective-index-backed version selection, action gating before version resolution, metadata trust gating for uninstall-safe markers, bulk update sequencing, failure detail state, and install state transitions. These live in `tests/` and drive `TuvApp` headlessly through keys and worker events (`python -m pytest tests`).
 
 ## References
 

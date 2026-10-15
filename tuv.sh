@@ -117,10 +117,11 @@ if ! PREP_OUTPUT=$("$BOOTSTRAP_PYTHON" "$APP" --prepare-runner --launcher-mode "
   echo "$PREP_OUTPUT" >&2
   exit 1
 fi
+TUV_RUNNER_READY=0
 eval "$(
   printf '%s\n' "$PREP_OUTPUT" | while IFS='=' read -r key value; do
     case "$key" in
-      TUV_NEWEST_PYTHON|TUV_RUNNER_VENV|TUV_RUNNER_PYTHON)
+      TUV_NEWEST_PYTHON|TUV_RUNNER_VENV|TUV_RUNNER_PYTHON|TUV_RUNNER_READY)
         printf "%s='%s'\n" "$key" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
         ;;
     esac
@@ -133,38 +134,44 @@ if [ -z "${TUV_RUNNER_VENV:-}" ] || [ -z "${TUV_RUNNER_PYTHON:-}" ]; then
 fi
 progress "runner venv: $TUV_RUNNER_VENV"
 
-progress "ensuring runner pip"
-if ! "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1; then
-  progress "restoring runner pip with ensurepip"
-  "$TUV_RUNNER_PYTHON" -m ensurepip --upgrade || fail_bootstrap "runner pip is unavailable and ensurepip could not restore it"
-  "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1 || fail_bootstrap "runner pip is unavailable after ensurepip"
-fi
+# --prepare-runner already verified runner pip, uv, and requirements in one
+# probe; the repair steps run only when something is missing.
+if [ "$TUV_RUNNER_READY" = "1" ]; then
+  progress "runner environment ready"
+else
+  progress "ensuring runner pip"
+  if ! "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1; then
+    progress "restoring runner pip with ensurepip"
+    "$TUV_RUNNER_PYTHON" -m ensurepip --upgrade || fail_bootstrap "runner pip is unavailable and ensurepip could not restore it"
+    "$TUV_RUNNER_PYTHON" -m pip --version >/dev/null 2>&1 || fail_bootstrap "runner pip is unavailable after ensurepip"
+  fi
 
-progress "ensuring runner uv"
-if ! "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1; then
-  progress "installing runner uv"
-  "$TUV_RUNNER_PYTHON" -m pip install uv || fail_bootstrap "runner uv is unavailable and could not be installed; network or package index access may be unavailable"
-  "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1 || fail_bootstrap "runner uv is unavailable after installation"
-fi
+  progress "ensuring runner uv"
+  if ! "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1; then
+    progress "installing runner uv"
+    "$TUV_RUNNER_PYTHON" -m pip install uv || fail_bootstrap "runner uv is unavailable and could not be installed; network or package index access may be unavailable"
+    "$TUV_RUNNER_PYTHON" -m uv --version >/dev/null 2>&1 || fail_bootstrap "runner uv is unavailable after installation"
+  fi
 
-REQ_HASH=$(hash_file "$REQ")
-STATE="$TUV_RUNNER_VENV/.tuv-requirements-state"
-STATE_HASH=""
-if [ -f "$STATE" ]; then
-  STATE_HASH=$(cat "$STATE")
-fi
+  REQ_HASH=$(hash_file "$REQ")
+  STATE="$TUV_RUNNER_VENV/.tuv-requirements-state"
+  STATE_HASH=""
+  if [ -f "$STATE" ]; then
+    STATE_HASH=$(cat "$STATE")
+  fi
 
-progress "checking runner requirements"
-if [ "$REQ_HASH" != "$STATE_HASH" ]; then
-  progress "installing runner requirements"
-  "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
-  printf '%s' "$REQ_HASH" > "$STATE"
-fi
+  progress "checking runner requirements"
+  if [ "$REQ_HASH" != "$STATE_HASH" ]; then
+    progress "installing runner requirements"
+    "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
+    printf '%s' "$REQ_HASH" > "$STATE"
+  fi
 
-if ! "$TUV_RUNNER_PYTHON" -c 'import packaging, wcwidth' >/dev/null 2>&1; then
-  progress "repairing runner requirements"
-  "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
-  printf '%s' "$REQ_HASH" > "$STATE"
+  if ! "$TUV_RUNNER_PYTHON" -c 'import packaging, wcwidth' >/dev/null 2>&1; then
+    progress "repairing runner requirements"
+    "$TUV_RUNNER_PYTHON" -m pip install -r "$REQ" || fail_bootstrap "requirements could not be installed; network or package index access may be unavailable"
+    printf '%s' "$REQ_HASH" > "$STATE"
+  fi
 fi
 
 progress "checking system uv provider"

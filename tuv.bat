@@ -75,10 +75,12 @@ if errorlevel 1 (
   exit /b 1
 )
 
+set "TUV_RUNNER_READY=0"
 for /f "usebackq tokens=1,* delims==" %%A in ("%PREP_OUT%") do (
   if "%%A"=="TUV_NEWEST_PYTHON" set "TUV_NEWEST_PYTHON=%%B"
   if "%%A"=="TUV_RUNNER_VENV" set "TUV_RUNNER_VENV=%%B"
   if "%%A"=="TUV_RUNNER_PYTHON" set "TUV_RUNNER_PYTHON=%%B"
+  if "%%A"=="TUV_RUNNER_READY" set "TUV_RUNNER_READY=%%B"
 )
 del "%PREP_OUT%" >nul 2>nul
 
@@ -92,6 +94,13 @@ if not defined TUV_RUNNER_PYTHON (
   exit /b 1
 )
 1>&2 echo(tuv: runner venv: %TUV_RUNNER_VENV%
+
+rem --prepare-runner already verified runner pip, uv, and requirements in one
+rem probe; the repair steps below run only when something is missing.
+if "%TUV_RUNNER_READY%"=="1" (
+  1>&2 echo(tuv: runner environment ready
+  goto runner_ready
+)
 
 1>&2 echo(tuv: ensuring runner pip
 "%TUV_RUNNER_PYTHON%" -m pip --version >nul 2>nul
@@ -149,6 +158,7 @@ if errorlevel 1 (
   > "%STATE%" echo(%REQ_HASH%
 )
 
+:runner_ready
 1>&2 echo(tuv: checking system uv provider
 set "TUV_SYSTEM_UV_EXE="
 for /f "delims=" %%U in ('where uv 2^>nul') do if not defined TUV_SYSTEM_UV_EXE set "TUV_SYSTEM_UV_EXE=%%U"
