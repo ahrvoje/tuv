@@ -23,12 +23,12 @@ goto collect_args
 1>&2 echo(tuv: starting (launcher mode: %LAUNCHER_MODE%)
 
 if not exist "%APP%" (
-  echo tuv.py was not found in %TUV_HOME% 1>&2
+  echo tuv.py was not found in "%TUV_HOME%" 1>&2
   exit /b 1
 )
 
 if not exist "%REQ%" (
-  echo requirements.txt was not found in %TUV_HOME% 1>&2
+  echo requirements.txt was not found in "%TUV_HOME%" 1>&2
   exit /b 1
 )
 
@@ -66,23 +66,17 @@ if not defined BOOTSTRAP_PYTHON (
 )
 1>&2 echo(tuv: runner Python: %BOOTSTRAP_PYTHON%
 
-for /f "delims=" %%T in ('powershell -NoProfile -Command "[IO.Path]::Combine($env:TEMP, 'tuv-runner-' + [IO.Path]::GetRandomFileName() + '.txt')"') do set "PREP_OUT=%%T"
 1>&2 echo(tuv: preparing runner environment
-"%BOOTSTRAP_PYTHON%" "%APP%" --prepare-runner --launcher-mode "%LAUNCHER_MODE%" > "%PREP_OUT%"
-if errorlevel 1 (
-  type "%PREP_OUT%" 1>&2
-  del "%PREP_OUT%" >nul 2>nul
-  exit /b 1
-)
-
+rem A failed preparation prints its own error and leaves the runner variables undefined.
+set "TUV_RUNNER_VENV="
+set "TUV_RUNNER_PYTHON="
 set "TUV_RUNNER_READY=0"
-for /f "usebackq tokens=1,* delims==" %%A in ("%PREP_OUT%") do (
+for /f "usebackq tokens=1,* delims==" %%A in (`^""%BOOTSTRAP_PYTHON%" "%APP%" --prepare-runner --launcher-mode "%LAUNCHER_MODE%"^"`) do (
   if "%%A"=="TUV_NEWEST_PYTHON" set "TUV_NEWEST_PYTHON=%%B"
   if "%%A"=="TUV_RUNNER_VENV" set "TUV_RUNNER_VENV=%%B"
   if "%%A"=="TUV_RUNNER_PYTHON" set "TUV_RUNNER_PYTHON=%%B"
   if "%%A"=="TUV_RUNNER_READY" set "TUV_RUNNER_READY=%%B"
 )
-del "%PREP_OUT%" >nul 2>nul
 
 if not defined TUV_RUNNER_VENV (
   echo Tuv runner preparation did not return a runner venv. 1>&2

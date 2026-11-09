@@ -1008,7 +1008,7 @@ def test_terminal_too_small_and_render_diff(ready):
     app.terminal.height = 30
     first = app.render()
     app.write_render_diff(first)
-    assert app.terminal.writes[-1] == tuv.HOME + first
+    assert app.terminal.writes[-1] == tuv.CLEAR + tuv.HOME + first
     ready.press("down")
     second = app.render()
     app.write_render_diff(second)
@@ -1056,3 +1056,48 @@ def test_color_hint_during_refresh(ready):
     rendered = app.render().split("\n")
     assert tuv.YELLOW in rendered[4] and tuv.LIGHT_GREEN in rendered[6]
     ready.pump()
+
+
+def test_refresh_retries_on_a_new_provider_when_the_old_one_broke(driver, monkeypatch):
+    default_rows(driver.backend)
+    context = make_context("venv", "proj")
+    healthy = tuv.UvProvider("standalone", Path("uv"), None, 3, "uv 1")
+    fake_list = tuv.build_package_rows
+    used = []
+
+    def build_package_rows(ctx, updated_names):
+        used.append(ctx.resolved_uv_provider)
+        if ctx.resolved_uv_provider is not healthy:
+            raise RuntimeError("No module named uv")
+        return fake_list(ctx, updated_names)
+
+    monkeypatch.setattr(tuv, "build_package_rows", build_package_rows)
+    driver.backend.provider = healthy
+    driver.start([context])
+    assert used == [PROVIDER, healthy] and context.resolved_uv_provider is healthy
+    assert len(driver.app.rows) == 4 and not any(m.startswith("Refresh failed") for m in driver.messages)
+
+
+def test_superseded_post_install_refresh_releases_install_slot(ready):
+    app = ready.app
+    ready.focus("requests")
+    ready.press("enter", settle=False)
+    ready.step()  # the install finishes; its refresh is still in flight
+    assert app.installing and app.refreshing
+    app.context_index = 1  # a rescan that lost the current context reloads another one
+    app.load_current_context()
+    ready.pump()
+    assert not app.installing and not app.refreshing
+
+
+def test_cancel_confirmation_kills_the_process_off_the_main_thread(ready):
+    app = ready.app
+    proc = object()
+    app.installing = True
+    app.install_proc = proc
+    app.confirm_cancel_install()
+    assert app.install_cancel_event.is_set() and ready.backend.terminated == []
+    ready.runner.run_all()
+    assert ready.backend.terminated == [proc]
+    app.installing = False
+    app.install_proc = None

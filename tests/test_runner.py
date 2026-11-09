@@ -299,7 +299,8 @@ def test_discover_contexts_real_layout(tmp_path, monkeypatch):
     monkeypatch.setenv("VIRTUAL_ENV", str(project / "other-env"))
     monkeypatch.setenv("TUV_NEWEST_PYTHON", sys.executable)
     monkeypatch.chdir(project)
-    monkeypatch.setattr(tuv, "refresh_context_uv_provider", lambda context: None)
+    resolved = []
+    monkeypatch.setattr(tuv, "refresh_context_uv_provider", resolved.append)
 
     contexts = tuv.discover_contexts()
     types = [context.type for context in contexts]
@@ -320,6 +321,8 @@ def test_discover_contexts_real_layout(tmp_path, monkeypatch):
     assert quick_types[0] == ("venv", "active")
     assert ("venv", "scanned") in quick_types
     assert quick_types[-1] == ("tuv", "tuv")
+    # The quick pass resolves uv for exactly the context the UI selects by default.
+    assert resolved[len(contexts):] == [quick[tuv.default_context_index(quick)]]
 
 
 def test_discover_python_infos_marks_cwd_source(tmp_path, monkeypatch):

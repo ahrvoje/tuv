@@ -147,6 +147,21 @@ def test_columns_scale_with_width():
     assert tuv.table_columns(40) == (12, 16, 16, 10)
 
 
+def test_scroll_to_show_keeps_index_in_window():
+    assert tuv.scroll_to_show(0, 3, 5, 20) == 0
+    assert tuv.scroll_to_show(0, 7, 5, 20) == 3
+    assert tuv.scroll_to_show(10, 4, 5, 20) == 4
+    assert tuv.scroll_to_show(18, 19, 5, 20) == 15
+    assert tuv.scroll_to_show(4, 0, 5, 0) == 0
+
+
+def test_row_versions_include_target_in_order():
+    row = tuv.PackageRow("p", "p", "1.0", target_version="1.10", candidate_versions=["1.0", "1.2", "1.10"])
+    assert row.versions is row.candidate_versions
+    row.target_version = "1.9"
+    assert row.versions == ["1.0", "1.2", "1.9", "1.10"]
+
+
 def test_step_index_clamps():
     assert tuv.step_index(0, "up", 5, 2) == 0
     assert tuv.step_index(0, "down", 5, 2) == 1

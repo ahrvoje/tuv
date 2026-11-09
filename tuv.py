@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from functools import partial
+from functools import lru_cache, partial
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, TypeVar
@@ -212,6 +212,13 @@ class PackageRow:
     def is_outdated(self) -> bool:
         return self.target_version != self.installed_version and self.status != "failed"
 
+    @property
+    def versions(self) -> list[str]:
+        """Candidates plus the target, oldest first. Every writer keeps `candidate_versions` sorted, so keys never pay a sort."""
+        if self.target_version in self.candidate_versions:
+            return self.candidate_versions
+        return sorted([*self.candidate_versions, self.target_version], key=version_key)
+
 
 @dataclass
 class Prompt:
@@ -256,6 +263,7 @@ class EffectiveIndexConfig:
 # --------------------------------------------------------------------------- generic helpers
 
 
+@lru_cache(maxsize=None)
 def version_key(value: str) -> tuple[int, object]:
     try:
         return (0, Version(value))
@@ -760,7 +768,7 @@ def refresh_context_uv_provider(context: PythonContext) -> UvProvider | None:
 
 def uv_command(context: PythonContext, args: list[str]) -> list[str]:
     # The provider resolved at discovery time is trusted; a provider that breaks
-    # mid-session surfaces as a command failure, which re-resolves it.
+    # mid-session fails the next package refresh, which re-resolves it.
     provider = context.resolved_uv_provider or refresh_context_uv_provider(context)
     if provider is None:
         raise RuntimeError(
@@ -1083,6 +1091,21 @@ def discover_contexts() -> list[PythonContext]:
     return contexts
 
 
+def default_context_index(contexts: list[PythonContext]) -> int:
+    preferences: list[Callable[[PythonContext], bool]] = [
+        lambda c: c.type == "venv" and c.source == "active",
+        lambda c: c.type == "venv" and c.root_path is not None and c.root_path.name == ".venv",
+        lambda c: c.type == "interpreter" and c.source == "cwd",
+        lambda c: c.type == "interpreter",
+        lambda c: c.type == "tuv",
+    ]
+    for prefer in preferences:
+        index = next((i for i, context in enumerate(contexts) if prefer(context)), None)
+        if index is not None:
+            return index
+    return 0
+
+
 def discover_priority_contexts() -> list[PythonContext]:
     """Only the contexts that can plausibly be selected by default, so the first frame is fast."""
     cwd = Path.cwd()
@@ -1101,11 +1124,8 @@ def discover_priority_contexts() -> list[PythonContext]:
     contexts.append(venv_context("tuv", RUNNER_VENV, "tuv venv", "tuv"))
     unique = unique_contexts(contexts)
     if unique:
-        preferred = next(
-            (c for c in unique if c.type == "venv" and (c.source == "active" or (c.root_path and c.root_path.name == ".venv"))),
-            unique[0],
-        )
-        refresh_context_uv_provider(preferred)
+        # Resolve the provider of the context the UI selects, so the main thread never has to.
+        refresh_context_uv_provider(unique[default_context_index(unique)])
     return unique
 
 
@@ -1114,13 +1134,7 @@ def discover_priority_contexts() -> list[PythonContext]:
 
 def run_uv_json(context: PythonContext, args: list[str], timeout: float | None = 90.0) -> object:
     command = uv_command(context, args)
-    try:
-        proc = run_command(command, timeout=timeout)
-    except FileNotFoundError:
-        # The provider executable vanished; drop caches so the next attempt re-resolves.
-        context.resolved_uv_provider = None
-        _UV_VERSION_CACHE.clear()
-        raise
+    proc = run_command(command, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(failed_command_detail(command, proc))
     try:
@@ -1888,6 +1902,8 @@ def slice_display(text: str, start: int, width: int) -> str:
     """Cells `start` to `start + width` of `text`, never splitting a wide character."""
     if width <= 0:
         return ""
+    if text.isascii():
+        return text[start : start + width]
     end = start + width
     position = 0
     output: list[str] = []
@@ -1952,7 +1968,7 @@ ESCAPE_KEYS = {
     "\x1b[5~": "pageup", "\x1b[6~": "pagedown",
     "\x1b[H": "home", "\x1b[F": "end", "\x1b[1~": "home", "\x1b[4~": "end", "\x1b[3~": "delete",
     "\x1b[12~": "f2", "\x1bOQ": "f2", "\x1b[13~": "f3", "\x1bOR": "f3", "\x1b[14~": "f4", "\x1bOS": "f4",
-    "\x1b[15~": "f5", "\x1b[17~": "f6", "\x1b[20~": "f9", "\x1b[21~": "f10", "\x1b[24~": "f12",
+    "\x1b[15~": "f5", "\x1b[17~": "f6", "\x1b[20~": "f9", "\x1b[21~": "f10",
 }
 ESCAPE_SEQUENCES = {sequence.encode("ascii"): key for sequence, key in ESCAPE_KEYS.items()}
 ESC_AMBIGUITY_WINDOW = 0.03
@@ -2162,6 +2178,15 @@ def table_columns(width: int) -> tuple[int, int, int, int]:
     return name_w, installed_w, target_w, action_w
 
 
+def scroll_to_show(scroll: int, index: int, visible: int, count: int) -> int:
+    """The scroll offset nearest to `scroll` that shows item `index` in a window of `visible` items."""
+    if index < scroll:
+        scroll = index
+    elif index >= scroll + visible:
+        scroll = index - visible + 1
+    return max(0, min(scroll, max(0, count - visible)))
+
+
 def step_index(index: int, key: str, count: int, page: int) -> int:
     """Move a list cursor for a navigation key, clamped to the list."""
     if count <= 0:
@@ -2338,7 +2363,6 @@ class TuvApp:
                 if size != self.last_size:
                     self.last_size = size
                     self.last_render = ""
-                    self.terminal.write(CLEAR + HOME)
                 screen = self.render()
                 if screen != self.last_render:
                     self.write_render_diff(screen)
@@ -2356,7 +2380,7 @@ class TuvApp:
         previous = self.last_render.splitlines()
         current = screen.splitlines()
         if not self.last_render or len(previous) != len(current):
-            self.terminal.write(HOME + screen)
+            self.terminal.write(CLEAR + HOME + screen)  # one write, so a resize never shows a blank frame
         else:
             changes = [f"\x1b[{index + 1};1H{line}" for index, line in enumerate(current) if line != previous[index]]
             if changes:
@@ -2402,7 +2426,7 @@ class TuvApp:
         if not self.discovering_contexts or self.contexts or not contexts:
             return
         self.contexts = contexts
-        self.context_index = self.context_overlay_index = self.default_context_index()
+        self.context_index = self.context_overlay_index = default_context_index(contexts)
         self.quick_context_loaded = True
         self.load_current_context()
 
@@ -2436,7 +2460,7 @@ class TuvApp:
             if wanted in ids:  # a venv created mid-install must not switch away from the install's context
                 self.set_message("Created venv is listed; select it with F9 after the current install", "warn")
         else:
-            self.context_index = self.context_overlay_index = self.default_context_index()
+            self.context_index = self.context_overlay_index = default_context_index(contexts)
             self.load_current_context()
         self.open_pending_context_selector()
 
@@ -2453,20 +2477,6 @@ class TuvApp:
         self.contexts = []
         self.discovery_error = f"Context discovery failed: {last_lines(error, 2)}"
         self.set_message(self.discovery_error, "error")
-
-    def default_context_index(self) -> int:
-        preferences: list[Callable[[PythonContext], bool]] = [
-            lambda c: c.type == "venv" and c.source == "active",
-            lambda c: c.type == "venv" and c.root_path is not None and c.root_path.name == ".venv",
-            lambda c: c.type == "interpreter" and c.source == "cwd",
-            lambda c: c.type == "interpreter",
-            lambda c: c.type == "tuv",
-        ]
-        for prefer in preferences:
-            index = next((i for i, context in enumerate(self.contexts) if prefer(context)), None)
-            if index is not None:
-                return index
-        return 0
 
     def request_context_selector(self) -> None:
         if self.discovering_contexts:
@@ -2615,7 +2625,16 @@ class TuvApp:
 
         def worker() -> None:
             try:
-                rows = build_package_rows(context, updated_names)
+                try:
+                    rows = build_package_rows(context, updated_names)
+                except Exception:
+                    # The installed list is a local query, so its failure can mean the uv provider
+                    # broke mid-session (uv uninstalled from its venv). Retry on a different one.
+                    stale = context.resolved_uv_provider
+                    _UV_VERSION_CACHE.clear()
+                    if refresh_context_uv_provider(context) in (None, stale):
+                        raise
+                    rows = build_package_rows(context, updated_names)
             except Exception as exc:
                 self.post(partial(self.on_refresh_failed, context.id, generation, str(exc), install_result))
                 return
@@ -2665,6 +2684,8 @@ class TuvApp:
 
     def on_refresh_done(self, context_id: str, generation: int, rows: list[PackageRow], install_result: InstallResult | None) -> None:
         if not self.is_current(context_id, generation):
+            if install_result is not None:
+                self.installing = False  # superseded, but the install it reports is over
             return
         self.refreshing = False
         if install_result is not None:
@@ -2700,13 +2721,14 @@ class TuvApp:
             self.start_health_check(context, generation)
 
     def on_refresh_failed(self, context_id: str, generation: int, error: str, install_result: InstallResult | None) -> None:
+        if install_result is not None:
+            self.installing = False
         if generation != self.refresh_generation:
             return
         self.refreshing = False
         if self.is_current(context_id):
             self.message = f"Refresh failed: {last_lines(error, 2)}"
         if install_result is not None:
-            self.installing = False
             if self.bulk_active:
                 self.continue_bulk_update()
             else:
@@ -2857,12 +2879,7 @@ class TuvApp:
         return max(1, height - 6)
 
     def ensure_scroll_visible(self) -> None:
-        visible = self.page_size()
-        if self.focus_index < self.scroll:
-            self.scroll = self.focus_index
-        elif self.focus_index >= self.scroll + visible:
-            self.scroll = self.focus_index - visible + 1
-        self.scroll = max(0, min(self.scroll, max(0, len(self.view) - visible)))
+        self.scroll = scroll_to_show(self.scroll, self.focus_index, self.page_size(), len(self.view))
 
     def natural_row_status(self, row: PackageRow) -> str:
         if row.target_version == row.installed_version:
@@ -2894,8 +2911,6 @@ class TuvApp:
     # ----------------------------------------------------------------- key handling
 
     def handle_key(self, key: str) -> None:
-        if key in {"\x1b", "escape", "Escape", "ESC"}:
-            key = "esc"
         modal = self.prompt or self.report_open or self.info_open or self.version_overlay or self.context_overlay
         if key == "q" and (modal or self.context_overlay_pending):
             key = "esc"
@@ -2982,7 +2997,7 @@ class TuvApp:
             )
 
     def confirm_cancel_install(self) -> None:
-        self.cancel_active_install()
+        self.cancel_active_install(block=False)
         self.set_message("Cancelling the running operation...", "warn")
 
     def handle_input_key(self, key: str) -> None:
@@ -3123,41 +3138,21 @@ class TuvApp:
         self.cancel_active_install()
         self.should_quit = True
 
-    def cancel_active_install(self) -> None:
+    def cancel_active_install(self, block: bool = True) -> None:
+        """Stop the running operation. Killing the process tree takes a while, so the UI passes `block=False`."""
         self.install_cancel_event.set()
+        if self.bulk_active:
+            self.bulk_queue = []
         with self.install_proc_lock:
             proc = self.install_proc
         if proc is not None:
-            terminate_process_tree(proc)
-        if self.bulk_active:
-            self.bulk_queue = []
+            terminate_process_tree(proc) if block else self.spawn(partial(terminate_process_tree, proc))
 
     # ----------------------------------------------------------------- versions
 
     def refresh_version_options(self, row: PackageRow) -> None:
-        self.version_options = sorted({*row.candidate_versions, row.target_version}, key=version_key, reverse=True)
+        self.version_options = row.versions[::-1]
         self.version_overlay_index = self.version_options.index(row.target_version)
-        self.ensure_version_overlay_visible()
-
-    def version_visible_items(self, height: int | None = None) -> int:
-        if height is None:
-            _, height = self.terminal.size()
-        height = max(height, 10)
-        overlay_h = min(height - 4, max(8, min(len(self.version_options) + 5, height - 4)))
-        return max(1, overlay_h - 4)
-
-    def ensure_version_overlay_visible(self, visible: int | None = None) -> None:
-        count = len(self.version_options)
-        if not count:
-            self.version_overlay_scroll = self.version_overlay_index = 0
-            return
-        visible = visible or self.version_visible_items()
-        self.version_overlay_index = max(0, min(self.version_overlay_index, count - 1))
-        if self.version_overlay_index < self.version_overlay_scroll:
-            self.version_overlay_scroll = self.version_overlay_index
-        elif self.version_overlay_index >= self.version_overlay_scroll + visible:
-            self.version_overlay_scroll = self.version_overlay_index - visible + 1
-        self.version_overlay_scroll = max(0, min(self.version_overlay_scroll, max(0, count - visible)))
 
     def start_version_lookup(self, row: PackageRow, pending_direction: int | None = None) -> bool:
         context = self.context
@@ -3192,7 +3187,7 @@ class TuvApp:
         self.post(partial(done, token, display_name, versions, yanked, None))
 
     def selectable_versions(self, row: PackageRow) -> list[str]:
-        candidates = sorted({*row.candidate_versions, row.target_version}, key=version_key)
+        candidates = row.versions
         # Arrow stepping skips yanked versions; they stay selectable in the
         # F4 overlay, where selection asks for confirmation.
         allowed = [v for v in candidates if v not in row.yanked_versions or v in {row.installed_version, row.target_version}]
@@ -3285,7 +3280,6 @@ class TuvApp:
             return
         elif key != "enter":
             self.version_overlay_index = step_index(self.version_overlay_index, key, len(self.version_options), self.page_size())
-            self.ensure_version_overlay_visible()
         elif self.new_package is not None:
             self.handle_new_package_version_enter()
         else:
@@ -3651,7 +3645,6 @@ class TuvApp:
         self.version_overlay_index = next((i for i, v in enumerate(ordered) if v not in yanked), 0)
         self.version_error = None
         self.pending_version_direction = None
-        self.ensure_version_overlay_visible()
         self.message = f"Select a version for {display_name}"
 
     def handle_new_package_version_enter(self) -> None:
@@ -4072,12 +4065,7 @@ class TuvApp:
         overlay_h = min(height, max(7, len(self.contexts) + 3))
         items_visible = overlay_h - 3
         count = len(self.contexts)
-        if self.context_overlay_index < self.context_overlay_scroll:
-            self.context_overlay_scroll = self.context_overlay_index
-        elif self.context_overlay_index >= self.context_overlay_scroll + items_visible:
-            self.context_overlay_scroll = self.context_overlay_index - items_visible + 1
-        self.context_overlay_scroll = max(0, min(self.context_overlay_scroll, max(0, count - items_visible)))
-        start = self.context_overlay_scroll
+        start = self.context_overlay_scroll = scroll_to_show(self.context_overlay_scroll, self.context_overlay_index, items_visible, count)
         title = "Context selector"
         if count > items_visible:
             title += f" ({start + 1}-{min(start + items_visible, count)}/{count})"
@@ -4107,8 +4095,9 @@ class TuvApp:
         overlay_w = min(width - 4, max(46, width // 2))
         overlay_h = min(height - 4, max(8, min(len(self.version_options) + 5, height - 4)))
         items_visible = overlay_h - 3
-        self.ensure_version_overlay_visible(items_visible)
-        start = self.version_overlay_scroll
+        start = self.version_overlay_scroll = scroll_to_show(
+            self.version_overlay_scroll, self.version_overlay_index, items_visible, len(self.version_options)
+        )
         if self.version_loading:
             hint = "Loading versions... | Esc/q close"
         elif self.version_error:
@@ -4231,10 +4220,12 @@ class TuvApp:
 
     def overlay_text(self, lines: list[str], width: int, height: int, title: str, body: list[str], scroll_attr: str | None = None) -> list[str]:
         overlay_w = min(width - 4, max(50, width * 4 // 5))
+        wrap_w = max(10, overlay_w - 4)
         wrapped: list[str] = []
         for line in body:
             line = sanitize_terminal_text(line)
-            wrapped += textwrap.wrap(line, width=max(10, overlay_w - 4)) or [""]
+            # textwrap costs ~0.1 ms per line; a long report must not pay it for lines that already fit.
+            wrapped += [line] if len(line) <= wrap_w else textwrap.wrap(line, width=wrap_w) or [""]
         overlay_h = min(height - 4, max(6, min(len(wrapped) + 3, height - 4)))
         visible = overlay_h - 2
         scroll = 0
